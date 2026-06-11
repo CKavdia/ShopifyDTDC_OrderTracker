@@ -5,6 +5,7 @@ import {
   getUnfulfilledOrders,
   getShopifyOrder,
   formatShippingAddress,
+  getOrderValue,
 } from "@/lib/shopify";
 
 export async function POST() {
@@ -56,7 +57,7 @@ export async function POST() {
         courierPartner:
           order.fulfillments?.[0]?.tracking_company || "DTDC",
         paymentMethod,
-        orderTotal: parseFloat(order.current_total_price || order.total_price || "0"),
+        orderTotal: getOrderValue(order),
         codCollectionStatus: isCOD ? "Pending" : "",
         orderDate: order.created_at.split("T")[0],
         fulfilledDate: order.fulfillments?.[0]?.created_at?.split("T")[0] || "",
@@ -126,7 +127,7 @@ export async function POST() {
         trackingNumber: "",
         courierPartner: "",
         paymentMethod,
-        orderTotal: parseFloat(order.current_total_price || order.total_price || "0"),
+        orderTotal: getOrderValue(order),
         codCollectionStatus: isCOD ? "Pending" : "",
         orderDate: order.created_at.split("T")[0],
         fulfilledDate: "",

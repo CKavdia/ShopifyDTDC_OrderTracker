@@ -542,6 +542,12 @@ export const notionProvider: DataProvider = {
       delete updateProps["RTO WhatsApp Sent"];
       delete updateProps["RTO Confirmed Status"];
       delete updateProps["OFD WhatsApp Sent"];
+      // Payment Method is set at order time and is only reliably knowable at creation
+      // (COD = financial_status "pending", Prepaid = "paid"). Once a COD order leaves
+      // "pending" (cash collected / cancelled / returned) it is indistinguishable from a
+      // manual-marked prepaid, so re-deriving on sync would wrongly flip COD → Prepaid.
+      // Keep it immutable after the first capture.
+      delete updateProps["Payment Method"];
       const res = await fetch(`${NOTION_API}/pages/${pageId}`, {
         method: "PATCH",
         headers: headers(),

@@ -98,6 +98,10 @@ export interface ShopifyOrder {
     tracking_numbers: string[];
     tracking_company: string | null;
   }>;
+  refunds?: Array<{
+    id: number;
+    transactions?: Array<{ kind: string; status: string; amount: string }>;
+  }>;
 }
 
 interface ShopifyCheckoutLineItem {
@@ -534,6 +538,26 @@ export async function adjustInventory(
     },
   });
   return { adjusted: true };
+}
+
+// Order value that reflects order EDITS but ignores RETURNS/REFUNDS.
+// current_total_price reflects both edits and refunds; adding back the money actually
+// refunded (refund transactions, kind="refund") cancels the refund portion, leaving the
+// edit-adjusted total. An order edit yields a $0 restock refund, so editing keeps the edited
+// value; a return yields a real refund, so it restores the original value (e.g. #1116: 50 +
+// 1990 = 2040). Refund line items are NOT used — an edit can list a removed item with no money
+// refunded, which would wrongly add it back.
+export function getOrderValue(order: ShopifyOrder): number {
+  const current = parseFloat(order.current_total_price || order.total_price || "0");
+  const refunded = (order.refunds || []).reduce(
+    (sum, r) =>
+      sum +
+      (r.transactions || [])
+        .filter((t) => t.kind === "refund" && t.status === "success")
+        .reduce((s, t) => s + parseFloat(t.amount || "0"), 0),
+    0
+  );
+  return current + refunded;
 }
 
 export function formatShippingAddress(
