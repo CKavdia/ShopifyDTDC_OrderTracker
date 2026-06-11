@@ -67,6 +67,7 @@ export interface ShopifyOrder {
   email: string;
   created_at: string;
   total_price: string;
+  current_total_price: string; // reflects order edits/refunds; total_price is frozen at creation
   financial_status: string;
   payment_gateway_names: string[];
   customer: {
@@ -333,15 +334,19 @@ export async function getOrderLineItems(
       line_items: Array<{
         title: string;
         quantity: number;
+        current_quantity?: number;
         variant_title: string | null;
       }>;
     };
   };
-  return data.order.line_items.map((li) => ({
-    title: li.title,
-    quantity: li.quantity,
-    variantTitle: li.variant_title || "",
-  }));
+  return data.order.line_items
+    .map((li) => ({
+      title: li.title,
+      // current_quantity reflects order edits (a swapped-out size has current_quantity 0)
+      quantity: li.current_quantity ?? li.quantity,
+      variantTitle: li.variant_title || "",
+    }))
+    .filter((li) => li.quantity > 0);
 }
 
 export async function markShopifyOrderPaid(shopifyOrderId: string): Promise<void> {
