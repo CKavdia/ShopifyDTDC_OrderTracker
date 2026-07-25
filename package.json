@@ -6,17 +6,21 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "invoice:setup": "tsx src/lib/notion-invoice-setup.ts",
+    "invoice:check": "tsx scripts/invoice-check.ts"
   },
   "dependencies": {
     "@base-ui/react": "^1.3.0",
     "@notionhq/client": "^5.15.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
+    "decimal.js": "^10.6.0",
     "exceljs": "^4.4.0",
     "lucide-react": "^1.7.0",
     "next": "16.2.1",
     "nodemailer": "^8.0.4",
+    "puppeteer": "^22.15.0",
     "react": "19.2.4",
     "react-dom": "19.2.4",
     "tailwind-merge": "^3.5.0",

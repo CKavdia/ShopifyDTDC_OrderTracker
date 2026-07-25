@@ -40,6 +40,7 @@ import {
   Clock,
   IndianRupee,
   RotateCcw,
+  PencilLine,
   Plus,
   X,
   Menu,
@@ -57,6 +58,7 @@ import {
   MessageCircle,
   Download,
   ShoppingCart,
+  FileText,
 } from "lucide-react";
 import {
   Dialog,
@@ -66,11 +68,13 @@ import {
 } from "@/components/ui/dialog";
 import { InfluencerSection } from "@/components/InfluencerSection";
 import { AbandonedCheckoutsSection } from "@/components/AbandonedCheckoutsSection";
+import { InvoicesSection } from "@/components/InvoicesSection";
 import { DTDCExportDialog } from "@/components/DTDCExportDialog";
 import { ShippingExportDialog } from "@/components/ShippingExportDialog";
 import { ShippingRatesPanel } from "@/components/ShippingSettingsDialog";
 import { WeightInput } from "@/components/WeightInput";
 import { getShippingConfig, calculateShippingCharge } from "@/lib/shipping";
+import { dtdcTrackingUrl } from "@/lib/dtdc";
 import type { Order, DeliveryStatus, TrackingEvent, ShippingRateTable } from "@/lib/data/types";
 
 // --- CONSTANTS ---
@@ -78,7 +82,7 @@ const AUTO_REFRESH_INTERVAL = 30 * 60 * 1000; // 30 minutes
 const SHOPIFY_STORE_URL = process.env.NEXT_PUBLIC_SHOPIFY_STORE_URL || "";
 const DEFAULT_DELAYED_THRESHOLD_DAYS = 7;
 
-type Tab = "orders" | "influencer" | "abandoned" | "analytics";
+type Tab = "orders" | "influencer" | "abandoned" | "analytics" | "invoices";
 
 // --- UTILITY FUNCTIONS ---
 function normalizeWhatsAppPhone(raw: string): string {
@@ -277,6 +281,11 @@ function Sidebar({ activeTab, onTabChange }: SidebarProps) {
       id: "abandoned",
       label: "Abandoned",
       icon: <ShoppingCart className="h-5 w-5" />,
+    },
+    {
+      id: "invoices",
+      label: "Invoices",
+      icon: <FileText className="h-5 w-5" />,
     },
     {
       id: "analytics",
@@ -1057,6 +1066,26 @@ function OrderTableDark({ orders, onOrderUpdated, delayThresholdDays, shippingCo
     }
   };
 
+  const handleStatusChange = async (orderId: string, status: string | null) => {
+    if (!status) return;
+    setActionLoading(`status-${orderId}`);
+    try {
+      const res = await fetch(`/api/orders/${orderId}/status`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ deliveryStatus: status }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || json?.success === false) {
+        alert(`Status update failed: ${json?.error || res.statusText}`);
+        return;
+      }
+      onOrderUpdated?.();
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
   const handleMarkRtoReceived = async (orderId: string) => {
     setActionLoading(`rto-received-${orderId}`);
     try {
@@ -1156,7 +1185,7 @@ function OrderTableDark({ orders, onOrderUpdated, delayThresholdDays, shippingCo
         };
 
         const zwspTracking = trackingNum.split("").join("\u200B");
-        const trackingLink = `https://txk.dtdc.com/ctbs-tracking/customerInterface.tr?submitName=showCITrackingDetails&cType=Consignment&cnNo=${trackingNum}`;
+        const trackingLink = dtdcTrackingUrl(trackingNum);
 
         const message = `Hi ${firstName}! ${E.pkg}
 
@@ -1628,6 +1657,27 @@ Thank you! ${E.heart}
                       className="bg-blue-950/40 border-b border-zinc-800/40 p-0 whitespace-normal"
                     >
                       <div className="px-6 py-5 border-l-2 border-l-blue-500/30">
+                        {/* GST Invoice */}
+                        <div className="flex items-center justify-between gap-3 mb-4 pb-4 border-b border-zinc-800/60">
+                          <span className="text-xs text-zinc-500">
+                            GST Tax Invoice for {order.orderNumber}
+                          </span>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="border-blue-500/30 text-blue-300 hover:bg-blue-500/10 bg-transparent"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              window.open(
+                                `/api/orders/${order.id}/invoice`,
+                                "_blank"
+                              );
+                            }}
+                          >
+                            <Download className="h-3.5 w-3.5 mr-1.5" />
+                            Download Invoice
+                          </Button>
+                        </div>
                         {/* Assign tracking for unfulfilled orders */}
                         {order.deliveryStatus === "Unfulfilled" && (
                           <div className="bg-yellow-500/5 border border-yellow-500/20 rounded-lg p-4 mb-4">
@@ -1859,9 +1909,20 @@ Thank you! ${E.heart}
                               <span className="text-zinc-500 text-xs block">
                                 Tracking #
                               </span>
-                              <span className="font-medium text-zinc-300">
-                                {order.trackingNumber || "-"}
-                              </span>
+                              {order.trackingNumber ? (
+                                <a
+                                  href={dtdcTrackingUrl(order.trackingNumber)}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="font-medium text-zinc-300 hover:text-white underline underline-offset-2 decoration-zinc-600"
+                                >
+                                  {order.trackingNumber}
+                                </a>
+                              ) : (
+                                <span className="font-medium text-zinc-300">
+                                  -
+                                </span>
+                              )}
                             </div>
                           </div>
                           {order.deliveredTimestamp && (
@@ -2022,6 +2083,41 @@ Thank you! ${E.heart}
                               Refresh Tracking
                             </Button>
                           )}
+
+                          {/* Manual status override (DTDC auto-tracking down) */}
+                          <Select
+                            value={order.deliveryStatus}
+                            onValueChange={(v) => handleStatusChange(order.id, v)}
+                          >
+                            <SelectTrigger className="w-44 h-8 text-xs font-medium bg-zinc-800/60 border-zinc-700/50 text-zinc-200 [&_svg]:text-current">
+                              <div className="flex items-center gap-1.5">
+                                {actionLoading === `status-${order.id}` ? (
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                ) : (
+                                  <PencilLine className="h-3.5 w-3.5" />
+                                )}
+                                <span className="text-zinc-500">Set:</span>
+                                <SelectValue placeholder="status" />
+                              </div>
+                            </SelectTrigger>
+                            <SelectContent className="bg-zinc-900 border-zinc-700/50 text-zinc-300">
+                              <SelectItem value="In Transit" className="focus:bg-zinc-800">
+                                In Transit
+                              </SelectItem>
+                              <SelectItem value="Out for Delivery" className="focus:bg-zinc-800">
+                                Out for Delivery
+                              </SelectItem>
+                              <SelectItem value="Delivered" className="text-emerald-400 focus:bg-zinc-800 focus:text-emerald-300">
+                                Delivered
+                              </SelectItem>
+                              <SelectItem value="Undelivered" className="text-amber-400 focus:bg-zinc-800 focus:text-amber-300">
+                                Undelivered
+                              </SelectItem>
+                              <SelectItem value="RTO" className="text-red-400 focus:bg-zinc-800 focus:text-red-300">
+                                RTO
+                              </SelectItem>
+                            </SelectContent>
+                          </Select>
 
                           {/* COD collection toggle */}
                           {order.paymentMethod === "COD" && (
@@ -3281,6 +3377,9 @@ export default function DashboardCommandCenter() {
 
           {/* Abandoned checkouts tab */}
           {activeTab === "abandoned" && <AbandonedCheckoutsSection />}
+
+          {/* Invoices tab */}
+          {activeTab === "invoices" && <InvoicesSection />}
 
           {/* Analytics tab */}
           {activeTab === "analytics" && (

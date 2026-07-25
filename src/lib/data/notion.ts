@@ -8,7 +8,14 @@ import {
   Product,
   CodConfirmationStatus,
   RtoConfirmationStatus,
+  InvoiceLogInput,
+  InvoiceRecord,
 } from "./types";
+import {
+  financialYear,
+  formatInvoiceNo,
+  parseSequence,
+} from "../invoice/numbering";
 
 const NOTION_API = "https://api.notion.com/v1";
 const NOTION_VERSION = "2022-06-28";
@@ -77,7 +84,8 @@ async function getDatabaseId(): Promise<string> {
   for (const block of data.results || []) {
     if (
       block.type === "child_database" &&
-      block.child_database?.title !== "Influencer Shipments"
+      block.child_database?.title !== "Influencer Shipments" &&
+      block.child_database?.title !== "UrbanNaari Invoices"
     ) {
       cachedDatabaseId = block.id;
       return block.id;
@@ -1469,7 +1477,319 @@ export const notionProvider: DataProvider = {
       throw new Error(`Notion update failed: ${res.status}`);
     }
   },
+
+  async getOrCreateInvoiceNumber(input: InvoiceLogInput) {
+    // Serialize so two concurrent generations can't grab the same number.
+    // (Single Next.js server + single admin -> an in-process lock is enough;
+    // Notion has no cross-process transactions.)
+    invoiceMutex = invoiceMutex.then(() => assignInvoiceNumber(input));
+    return invoiceMutex;
+  },
+
+  getInvoiceStartNumber(fy: string) {
+    return getInvoiceStartNumber(fy);
+  },
+
+  setInvoiceStartNumber(fy: string, n: number) {
+    return setInvoiceStartNumber(fy, n);
+  },
+
+  getMaxInvoiceSequence(fy: string) {
+    return getMaxInvoiceSequence(fy);
+  },
+
+  async listInvoices(): Promise<InvoiceRecord[]> {
+    const dbId = await getInvoicesDatabaseId();
+    const rows = await queryDatabase(dbId, undefined, [
+      { property: "Invoice Date", direction: "descending" },
+    ]);
+    return rows.map((row) => {
+      const props = (row as { properties: Record<string, unknown> }).properties;
+      const title = (props["Invoice No"] as { title?: Array<{ plain_text: string }> })
+        ?.title?.[0]?.plain_text || "";
+      const text = (key: string) =>
+        (props[key] as { rich_text?: Array<{ plain_text: string }> })?.rich_text
+          ?.map((b) => b.plain_text)
+          .join("") || "";
+      const num = (key: string) =>
+        (props[key] as { number?: number | null })?.number ?? 0;
+      const date =
+        (props["Invoice Date"] as { date?: { start: string } | null })?.date?.start || "";
+      const select =
+        (props["Status"] as { select?: { name: string } | null })?.select?.name || "";
+      return {
+        invoiceNo: title,
+        shopifyOrderId: text("Shopify Order ID"),
+        orderNumber: text("Order Number"),
+        invoiceDate: date,
+        customerName: text("Customer"),
+        placeOfSupply: text("Place of Supply"),
+        taxableValue: num("Taxable Value"),
+        cgst: num("CGST"),
+        sgst: num("SGST"),
+        igst: num("IGST"),
+        grandTotal: num("Grand Total"),
+        fy: text("FY"),
+        status: select,
+      };
+    });
+  },
 };
+
+// --- Invoices database (numbering + log) ----------------------------------
+
+let cachedInvoicesDbId: string | null = null;
+let invoiceMutex: Promise<{ invoiceNo: string; reused: boolean }> =
+  Promise.resolve({ invoiceNo: "", reused: false });
+
+const INVOICES_DB_TITLE = "UrbanNaari Invoices";
+
+// Get the invoices database, creating it on first use if it doesn't exist yet.
+// (Schema mirrors src/lib/notion-invoice-setup.ts, which stays as a manual fallback.)
+async function getInvoicesDatabaseId(): Promise<string> {
+  if (cachedInvoicesDbId) return cachedInvoicesDbId;
+  const pageId = process.env.NOTION_PAGE_ID!;
+  const res = await fetch(
+    `${NOTION_API}/blocks/${pageId}/children?page_size=100`,
+    { headers: headers() }
+  );
+  const data = await res.json();
+  for (const block of data.results || []) {
+    if (
+      block.type === "child_database" &&
+      block.child_database?.title === INVOICES_DB_TITLE
+    ) {
+      cachedInvoicesDbId = block.id;
+      return block.id;
+    }
+  }
+
+  const createRes = await fetch(`${NOTION_API}/databases`, {
+    method: "POST",
+    headers: headers(),
+    body: JSON.stringify({
+      parent: { type: "page_id", page_id: pageId },
+      title: [{ text: { content: INVOICES_DB_TITLE } }],
+      properties: {
+        "Invoice No": { title: {} },
+        "Shopify Order ID": { rich_text: {} },
+        "Order Number": { rich_text: {} },
+        "Invoice Date": { date: {} },
+        Customer: { rich_text: {} },
+        "Place of Supply": { rich_text: {} },
+        "Taxable Value": { number: { format: "number" } },
+        CGST: { number: { format: "number" } },
+        SGST: { number: { format: "number" } },
+        IGST: { number: { format: "number" } },
+        "Grand Total": { number: { format: "number" } },
+        FY: { rich_text: {} },
+        Status: {
+          select: {
+            options: [
+              { name: "Issued", color: "green" },
+              { name: "Cancelled", color: "red" },
+            ],
+          },
+        },
+      },
+    }),
+  });
+  if (!createRes.ok) {
+    const err = await createRes.text();
+    throw new Error(
+      `Failed to create "${INVOICES_DB_TITLE}" database: ${err.slice(0, 200)}`
+    );
+  }
+  const created = await createRes.json();
+  cachedInvoicesDbId = created.id;
+  return created.id;
+}
+
+// --- Invoice settings (per-FY starting number) ---------------------------
+
+let cachedInvoiceSettingsDbId: string | null = null;
+const INVOICE_SETTINGS_DB_TITLE = "UrbanNaari Invoice Settings";
+
+// Small key/value database: one row per financial year holding its start number.
+async function getOrCreateInvoiceSettingsDbId(): Promise<string> {
+  if (cachedInvoiceSettingsDbId) return cachedInvoiceSettingsDbId;
+  const pageId = process.env.NOTION_PAGE_ID!;
+  const res = await fetch(
+    `${NOTION_API}/blocks/${pageId}/children?page_size=100`,
+    { headers: headers() }
+  );
+  const data = await res.json();
+  for (const block of data.results || []) {
+    if (
+      block.type === "child_database" &&
+      block.child_database?.title === INVOICE_SETTINGS_DB_TITLE
+    ) {
+      cachedInvoiceSettingsDbId = block.id;
+      return block.id;
+    }
+  }
+
+  const createRes = await fetch(`${NOTION_API}/databases`, {
+    method: "POST",
+    headers: headers(),
+    body: JSON.stringify({
+      parent: { type: "page_id", page_id: pageId },
+      title: [{ text: { content: INVOICE_SETTINGS_DB_TITLE } }],
+      properties: {
+        FY: { title: {} },
+        "Start Number": { number: { format: "number" } },
+      },
+    }),
+  });
+  if (!createRes.ok) {
+    const err = await createRes.text();
+    throw new Error(
+      `Failed to create "${INVOICE_SETTINGS_DB_TITLE}" database: ${err.slice(0, 200)}`
+    );
+  }
+  const created = await createRes.json();
+  cachedInvoiceSettingsDbId = created.id;
+  return created.id;
+}
+
+// The configured starting sequence number for a financial year, or null if unset.
+async function getInvoiceStartNumber(fy: string): Promise<number | null> {
+  const dbId = await getOrCreateInvoiceSettingsDbId();
+  const rows = await queryDatabase(dbId, {
+    property: "FY",
+    title: { equals: fy },
+  });
+  if (rows.length === 0) return null;
+  const props = (rows[0] as { properties: Record<string, unknown> }).properties;
+  const n = (props["Start Number"] as { number?: number | null })?.number;
+  return typeof n === "number" ? n : null;
+}
+
+// Upsert the starting number for a financial year.
+async function setInvoiceStartNumber(fy: string, n: number): Promise<void> {
+  const dbId = await getOrCreateInvoiceSettingsDbId();
+  const rows = await queryDatabase(dbId, {
+    property: "FY",
+    title: { equals: fy },
+  });
+  const properties = {
+    FY: { title: [{ text: { content: fy } }] },
+    "Start Number": { number: n },
+  };
+  if (rows.length > 0) {
+    const pageId = (rows[0] as { id: string }).id;
+    const res = await fetch(`${NOTION_API}/pages/${pageId}`, {
+      method: "PATCH",
+      headers: headers(),
+      body: JSON.stringify({ properties }),
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`Failed to update invoice start number: ${err.slice(0, 200)}`);
+    }
+  } else {
+    const res = await fetch(`${NOTION_API}/pages`, {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({ parent: { database_id: dbId }, properties }),
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`Failed to create invoice start number: ${err.slice(0, 200)}`);
+    }
+  }
+}
+
+// Highest invoice sequence already issued in a financial year (0 if none).
+async function getMaxInvoiceSequence(fy: string): Promise<number> {
+  const dbId = await getInvoicesDatabaseId();
+  const rows = await queryDatabase(dbId, {
+    property: "FY",
+    rich_text: { equals: fy },
+  });
+  let maxSeq = 0;
+  for (const row of rows) {
+    const props = (row as { properties: Record<string, unknown> }).properties;
+    const titleProp = props["Invoice No"] as {
+      title?: Array<{ plain_text: string }>;
+    };
+    maxSeq = Math.max(maxSeq, parseSequence(titleProp?.title?.[0]?.plain_text || ""));
+  }
+  return maxSeq;
+}
+
+async function assignInvoiceNumber(
+  input: InvoiceLogInput
+): Promise<{ invoiceNo: string; reused: boolean }> {
+  const dbId = await getInvoicesDatabaseId();
+
+  // Reuse if this order already has an invoice.
+  const existing = await queryDatabase(dbId, {
+    property: "Shopify Order ID",
+    rich_text: { equals: input.shopifyOrderId },
+  });
+  if (existing.length > 0) {
+    const props = (existing[0] as { properties: Record<string, unknown> })
+      .properties;
+    const titleProp = props["Invoice No"] as {
+      title?: Array<{ plain_text: string }>;
+    };
+    const invoiceNo = titleProp?.title?.[0]?.plain_text || "";
+    if (invoiceNo) return { invoiceNo, reused: true };
+  }
+
+  // Next sequence within the current financial year.
+  const fy = financialYear(new Date(input.invoiceDate));
+  const fyRows = await queryDatabase(dbId, {
+    property: "FY",
+    rich_text: { equals: fy },
+  });
+  let maxSeq = 0;
+  for (const row of fyRows) {
+    const props = (row as { properties: Record<string, unknown> }).properties;
+    const titleProp = props["Invoice No"] as {
+      title?: Array<{ plain_text: string }>;
+    };
+    const no = titleProp?.title?.[0]?.plain_text || "";
+    maxSeq = Math.max(maxSeq, parseSequence(no));
+  }
+  // Apply the configured per-FY starting number as a floor (e.g. continue an
+  // existing sequence at 51). Never goes below what's already been issued.
+  const start = await getInvoiceStartNumber(fy);
+  const nextSeq = Math.max(maxSeq, (start ?? 1) - 1) + 1;
+  const invoiceNo = formatInvoiceNo(fy, nextSeq);
+
+  await fetch(`${NOTION_API}/pages`, {
+    method: "POST",
+    headers: headers(),
+    body: JSON.stringify({
+      parent: { database_id: dbId },
+      properties: {
+        "Invoice No": { title: [{ text: { content: invoiceNo } }] },
+        "Shopify Order ID": {
+          rich_text: [{ text: { content: input.shopifyOrderId } }],
+        },
+        "Order Number": {
+          rich_text: [{ text: { content: input.orderNumber } }],
+        },
+        "Invoice Date": { date: { start: input.invoiceDate } },
+        Customer: { rich_text: [{ text: { content: input.customerName } }] },
+        "Place of Supply": {
+          rich_text: [{ text: { content: input.placeOfSupply } }],
+        },
+        "Taxable Value": { number: input.taxableValue },
+        CGST: { number: input.cgst },
+        SGST: { number: input.sgst },
+        IGST: { number: input.igst },
+        "Grand Total": { number: input.grandTotal },
+        FY: { rich_text: [{ text: { content: fy } }] },
+        Status: { select: { name: "Issued" } },
+      },
+    }),
+  });
+
+  return { invoiceNo, reused: false };
+}
 
 // --- Abandoned Checkouts WA Tracking ---
 

@@ -3,6 +3,14 @@ import { DeliveryStatus, TrackingEvent } from "@/lib/data/types";
 const DTDC_TRACK_URL =
   "https://www.dtdc.com/wp-json/custom/v1/domestic/track";
 
+/**
+ * Customer-facing DTDC deep-link that opens the parcel status page with the
+ * AWB pre-filled. Used for both displayed tracking links and WhatsApp messages.
+ */
+export function dtdcTrackingUrl(trackingNumber: string): string {
+  return `https://txk.dtdc.com/ctbs-tracking/customerInterface.tr?submitName=showCITrackingDetails&cType=Consignment&cnNo=${encodeURIComponent(trackingNumber)}`;
+}
+
 interface DTDCMilestone {
   mileName: string;
   mileLocationName: string;

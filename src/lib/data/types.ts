@@ -246,4 +246,46 @@ export interface DataProvider {
     shipmentId: string,
     trackingNumber: string
   ): Promise<void>;
+  // Invoicing: assign (or reuse) a sequential invoice number and log it.
+  getOrCreateInvoiceNumber(
+    input: InvoiceLogInput
+  ): Promise<{ invoiceNo: string; reused: boolean }>;
+  // List issued invoices (newest first) for the Invoices page.
+  listInvoices(): Promise<InvoiceRecord[]>;
+  // Per-FY starting invoice number (floor). null if unset.
+  getInvoiceStartNumber(fy: string): Promise<number | null>;
+  setInvoiceStartNumber(fy: string, n: number): Promise<void>;
+  // Highest invoice sequence already issued in a financial year (0 if none).
+  getMaxInvoiceSequence(fy: string): Promise<number>;
+}
+
+// Data needed to log an issued invoice in the Invoices database.
+export interface InvoiceLogInput {
+  shopifyOrderId: string;
+  orderNumber: string;
+  customerName: string;
+  invoiceDate: string; // ISO date
+  placeOfSupply: string;
+  taxableValue: number;
+  cgst: number;
+  sgst: number;
+  igst: number;
+  grandTotal: number;
+}
+
+// A logged invoice as read back from the Invoices database.
+export interface InvoiceRecord {
+  invoiceNo: string;
+  shopifyOrderId: string;
+  orderNumber: string;
+  invoiceDate: string;
+  customerName: string;
+  placeOfSupply: string;
+  taxableValue: number;
+  cgst: number;
+  sgst: number;
+  igst: number;
+  grandTotal: number;
+  fy: string;
+  status: string;
 }

@@ -13,8 +13,16 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { InfluencerShipment, Product, DeliveryStatus } from "@/lib/data/types";
+import { dtdcTrackingUrl } from "@/lib/dtdc";
 import { TrackingTimeline } from "./TrackingTimeline";
 import { Switch } from "@/components/ui/switch";
+import {
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+} from "@/components/ui/select";
 import {
   ChevronDown,
   ChevronRight,
@@ -804,9 +812,15 @@ export function InfluencerSection() {
                                   ) : shipment.trackingNumber ? (
                                     <div className="flex items-center gap-1">
                                       <Package className="h-3 w-3 text-zinc-500" />
-                                      <span className="font-medium text-zinc-200">
+                                      <a
+                                        href={dtdcTrackingUrl(shipment.trackingNumber)}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        onClick={(e) => e.stopPropagation()}
+                                        className="font-medium text-zinc-200 hover:text-white underline underline-offset-2 decoration-zinc-600"
+                                      >
                                         {shipment.trackingNumber}
-                                      </span>
+                                      </a>
                                       <Button
                                         variant="ghost"
                                         size="sm"
@@ -948,6 +962,37 @@ export function InfluencerSection() {
                                   ? "Shipping Paid"
                                   : "Mark Shipping Paid"}
                               </Button>
+                              {/* Manual status override (DTDC auto-tracking down) */}
+                              <div onClick={(e) => e.stopPropagation()}>
+                                <Select
+                                  value={shipment.deliveryStatus}
+                                  onValueChange={(v) =>
+                                    handleUpdateInfluencerStatus(shipment.id, v as DeliveryStatus)
+                                  }
+                                >
+                                  <SelectTrigger className="w-40 h-7 text-xs font-medium bg-zinc-800/60 border-zinc-700/50 text-zinc-200">
+                                    <span className="text-zinc-500 mr-1">Set:</span>
+                                    <SelectValue placeholder="status" />
+                                  </SelectTrigger>
+                                  <SelectContent className="bg-zinc-900 border-zinc-700/50 text-zinc-300">
+                                    <SelectItem value="In Transit" className="focus:bg-zinc-800">
+                                      In Transit
+                                    </SelectItem>
+                                    <SelectItem value="Out for Delivery" className="focus:bg-zinc-800">
+                                      Out for Delivery
+                                    </SelectItem>
+                                    <SelectItem value="Delivered" className="text-emerald-400 focus:bg-zinc-800 focus:text-emerald-300">
+                                      Delivered
+                                    </SelectItem>
+                                    <SelectItem value="Undelivered" className="text-amber-400 focus:bg-zinc-800 focus:text-amber-300">
+                                      Undelivered
+                                    </SelectItem>
+                                    <SelectItem value="RTO" className="text-red-400 focus:bg-zinc-800 focus:text-red-300">
+                                      RTO
+                                    </SelectItem>
+                                  </SelectContent>
+                                </Select>
+                              </div>
                             </div>
                             {/* Status actions */}
                             {shipment.deliveryStatus === "Delivered" && (
