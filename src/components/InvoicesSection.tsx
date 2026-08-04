@@ -12,7 +12,15 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { InvoiceRecord } from "@/lib/data/types";
-import { RefreshCw, Download, FileText, Loader2, Search } from "lucide-react";
+import { ManualInvoicePanel } from "@/components/ManualInvoicePanel";
+import {
+  RefreshCw,
+  Download,
+  FileText,
+  FilePlus,
+  Loader2,
+  Search,
+} from "lucide-react";
 
 function inr(n: number): string {
   return "₹" + n.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -78,6 +86,9 @@ export function InvoicesSection() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
+
+  // Manual (non-Shopify) invoice form
+  const [creating, setCreating] = useState(false);
 
   // Date-range merged-PDF export
   const [rangeStart, setRangeStart] = useState("");
@@ -219,6 +230,15 @@ export function InvoicesSection() {
           <Button
             size="sm"
             variant="outline"
+            className="border-blue-500/30 text-blue-300 hover:bg-blue-500/10 bg-transparent"
+            onClick={() => setCreating((v) => !v)}
+          >
+            <FilePlus className="h-3.5 w-3.5 mr-1.5" />
+            New manual invoice
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
             className="border-zinc-700 text-zinc-300 hover:bg-zinc-800 bg-transparent"
             onClick={load}
             disabled={loading}
@@ -232,6 +252,11 @@ export function InvoicesSection() {
           </Button>
         </div>
       </div>
+
+      <ManualInvoicePanel
+        visible={creating}
+        onClose={() => setCreating(false)}
+      />
 
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
         {/* Date-range merged-PDF export */}

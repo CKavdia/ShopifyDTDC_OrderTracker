@@ -21,6 +21,10 @@ export const seller = {
   email: "admin@urbannaari.co.in",
   website: "urbannaari.co.in",
 
+  // Printed as "Company's PAN". Leave blank to derive it from the GSTIN, whose
+  // characters 3-12 are the PAN (08FELPM3724K1Z1 -> FELPM3724K).
+  pan: "",
+
   // Optional assets. Absolute paths, or paths relative to the project root.
   logoPath: "public/invoice-logo.png",
   signaturePath: "",
@@ -62,4 +66,48 @@ export const GST_STATE_CODES: Record<string, string> = {
   MH: "27", MN: "14", ML: "17", MZ: "15", NL: "13", OR: "21", PY: "34",
   PB: "03", RJ: "08", SK: "11", TN: "33", TG: "36", TS: "36", TR: "16",
   UP: "09", UT: "05", UK: "05", WB: "19",
+};
+
+// Display names for the same codes. Shopify supplies the province name on its
+// orders, but a manually-typed invoice only has the code, so the name has to
+// come from here. TS/UK are duplicate codes for TG/UT and are deliberately
+// omitted so a state dropdown built from this map has no repeated entries.
+export const GST_STATE_NAMES: Record<string, string> = {
+  AN: "Andaman and Nicobar Islands",
+  AP: "Andhra Pradesh",
+  AR: "Arunachal Pradesh",
+  AS: "Assam",
+  BR: "Bihar",
+  CH: "Chandigarh",
+  CT: "Chhattisgarh",
+  DN: "Dadra and Nagar Haveli",
+  DD: "Daman and Diu",
+  DL: "Delhi",
+  GA: "Goa",
+  GJ: "Gujarat",
+  HR: "Haryana",
+  HP: "Himachal Pradesh",
+  JK: "Jammu and Kashmir",
+  JH: "Jharkhand",
+  KA: "Karnataka",
+  KL: "Kerala",
+  LA: "Ladakh",
+  LD: "Lakshadweep",
+  MP: "Madhya Pradesh",
+  MH: "Maharashtra",
+  MN: "Manipur",
+  ML: "Meghalaya",
+  MZ: "Mizoram",
+  NL: "Nagaland",
+  OR: "Odisha",
+  PY: "Puducherry",
+  PB: "Punjab",
+  RJ: "Rajasthan",
+  SK: "Sikkim",
+  TN: "Tamil Nadu",
+  TG: "Telangana",
+  TR: "Tripura",
+  UP: "Uttar Pradesh",
+  UT: "Uttarakhand",
+  WB: "West Bengal",
 };

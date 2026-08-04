@@ -22,6 +22,9 @@ export interface InvoiceLine {
   variantTitle: string;
   sku: string;
   hsn: string;
+  // Unit of measure for the invoice's "per" column ("PCS"). Blank marks a
+  // service line (shipping/COD), which Tally excludes from the pieces total.
+  unit: string;
   qty: Decimal;
   unitPricePreTax: Decimal;
   grossPreTax: Decimal;
@@ -170,15 +173,7 @@ function computeLine(li: InvoiceLineItem, intraState: boolean): InvoiceLine {
   // Discount on the taxable (pre-tax) basis so every column reconciles.
   const discountPreTax = money(grossPreTax).minus(money(taxableValue));
 
-  let cgst = new Decimal(0);
-  let sgst = new Decimal(0);
-  let igst = new Decimal(0);
-  if (intraState) {
-    cgst = money(gst.dividedBy(2));
-    sgst = money(gst.minus(cgst)); // keep paise exact: sgst = gst - cgst
-  } else {
-    igst = money(gst);
-  }
+  const { cgst, sgst, igst } = splitTax(taxableValue, rate, intraState);
 
   return {
     title: li.title,
@@ -186,6 +181,7 @@ function computeLine(li: InvoiceLineItem, intraState: boolean): InvoiceLine {
       li.variantTitle && li.variantTitle !== "Default Title" ? li.variantTitle : "",
     sku: li.sku || "",
     hsn: li.product?.hsn?.value || "",
+    unit: "PCS",
     qty,
     unitPricePreTax: money(unitPricePreTax),
     grossPreTax: money(grossPreTax),
@@ -197,9 +193,28 @@ function computeLine(li: InvoiceLineItem, intraState: boolean): InvoiceLine {
     cgst,
     sgst,
     igst,
-    gst: money(gst),
+    // The heads are the authoritative figures once split, so keep `gst` equal
+    // to their sum rather than to the pre-split value.
+    gst: money(cgst.plus(sgst).plus(igst)),
     lineTotal: money(netInclTax),
   };
+}
+
+// Split tax into heads the way GST law (and Tally) does it: each head is
+// computed from the taxable value at its own rate and rounded independently.
+// Halving a single rounded total instead would leave CGST and SGST differing
+// by a paise on odd amounts, which is wrong on the face of an invoice.
+function splitTax(
+  taxableValue: Decimal,
+  rate: Decimal,
+  intraState: boolean
+): { cgst: Decimal; sgst: Decimal; igst: Decimal } {
+  const zero = new Decimal(0);
+  if (intraState) {
+    const half = money(taxableValue.times(rate.dividedBy(2)).dividedBy(100));
+    return { cgst: half, sgst: half, igst: zero };
+  }
+  return { cgst: zero, sgst: zero, igst: money(taxableValue.times(rate).dividedBy(100)) };
 }
 
 // A flat GST-inclusive charge (e.g. shipping / COD fee) as a taxable line.
@@ -211,20 +226,13 @@ function computeFlatLine(
 ): InvoiceLine {
   const gst = amountInclTax.times(rate).dividedBy(rate.plus(100));
   const taxable = amountInclTax.minus(gst);
-  let cgst = new Decimal(0);
-  let sgst = new Decimal(0);
-  let igst = new Decimal(0);
-  if (intraState) {
-    cgst = money(gst.dividedBy(2));
-    sgst = money(gst.minus(cgst));
-  } else {
-    igst = money(gst);
-  }
+  const { cgst, sgst, igst } = splitTax(taxable, rate, intraState);
   return {
     title,
     variantTitle: "",
     sku: "",
     hsn: "",
+    unit: "", // service line
     qty: new Decimal(1),
     unitPricePreTax: money(taxable),
     grossPreTax: money(taxable),
@@ -236,7 +244,7 @@ function computeFlatLine(
     cgst,
     sgst,
     igst,
-    gst: money(gst),
+    gst: money(cgst.plus(sgst).plus(igst)),
     lineTotal: money(amountInclTax),
   };
 }
