@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { data } from "@/lib/data";
 import { trackShipment } from "@/lib/dtdc";
 import { resolveStatus, validateTransition, logBlockedTransition } from "@/lib/status-machine";
+import { pushShopifyShipmentStatus, toShopifyShipmentStatus } from "@/lib/shopify";
 
 export async function POST() {
   try {
@@ -18,7 +19,8 @@ export async function POST() {
     let refreshed = 0;
     let errors = 0;
     let blocked = 0;
-    const results: Array<{ trackingNumber: string; status: string; error?: string; blocked?: boolean; reason?: string }> = [];
+    let shopifyPushed = 0;
+    const results: Array<{ trackingNumber: string; status: string; error?: string; blocked?: boolean; reason?: string; shopifyError?: string }> = [];
 
     for (const order of activeOrders) {
       if (!order.trackingNumber) continue;
@@ -65,9 +67,39 @@ export async function POST() {
               trackingTimeline: result.timeline,
             }, order.id);
             refreshed++;
+
+            // Mirror the shipment status to Shopify. Deliberately not gated on
+            // the status having changed: Notion is already committed, so a
+            // transient push failure would otherwise never be retried and
+            // Shopify would stay behind forever. The rank guard inside
+            // pushShopifyShipmentStatus makes the repeat case a cheap no-op.
+            // Best-effort — a Shopify failure must not count as a sync error.
+            const shipmentStatus = toShopifyShipmentStatus(resolvedStatus);
+            let shopifyError: string | undefined;
+            if (shipmentStatus) {
+              try {
+                const push = await pushShopifyShipmentStatus(
+                  order.shopifyOrderId,
+                  shipmentStatus,
+                  {
+                    trackingNumber: order.trackingNumber,
+                    happenedAt: deliveredTimestamp || undefined,
+                  }
+                );
+                if (push.pushed) shopifyPushed++;
+              } catch (err) {
+                shopifyError = err instanceof Error ? err.message : "Shopify push failed";
+                console.error(
+                  `Shopify shipment status push failed for ${order.trackingNumber}:`,
+                  shopifyError
+                );
+              }
+            }
+
             results.push({
               trackingNumber: order.trackingNumber,
               status: resolvedStatus,
+              ...(shopifyError ? { shopifyError } : {}),
             });
           } catch (updateError) {
             errors++;
@@ -94,6 +126,7 @@ export async function POST() {
       refreshed,
       errors,
       blocked,
+      shopifyPushed,
       total: activeOrders.length,
       results,
     });

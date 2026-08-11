@@ -226,7 +226,11 @@ scripts/                      # One-off debug/migration scripts (e.g. debug-chec
 
 1. Go to Shopify Admin > Settings > Apps and sales channels > Develop apps
 2. Create a custom app
-3. Add scopes: `read_orders`, `read_fulfillments`, `read_all_orders`
+3. Add scopes: `read_orders`, `read_all_orders`, `write_orders`, `write_fulfillments`, `write_merchant_managed_fulfillment_orders`, `write_inventory`
+
+   The app writes as well as reads: it creates fulfillments with DTDC tracking,
+   posts fulfillment events (out for delivery / delivered), captures COD
+   payments, cancels orders, and adjusts inventory for influencer shipments.
 4. Install the app
 5. Use the Client ID and Client Secret in `.env.local`
 

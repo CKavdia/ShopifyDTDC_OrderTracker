@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { data } from "@/lib/data";
 import { trackShipment } from "@/lib/dtdc";
 import { resolveStatus, validateTransition, logBlockedTransition } from "@/lib/status-machine";
+import { pushShopifyShipmentStatus, toShopifyShipmentStatus } from "@/lib/shopify";
 
 export async function POST(
   _request: NextRequest,
@@ -72,7 +73,39 @@ export async function POST(
       trackingTimeline: result.timeline,
     });
 
-    return NextResponse.json({ success: true, status: resolvedStatus });
+    // Best-effort mirror to Shopify — never fails the request, since the Notion
+    // write above already succeeded. Not gated on the status having changed, so
+    // this button doubles as the manual recovery for a push that failed earlier
+    // (the rank guard makes an already-synced order a no-op).
+    const shipmentStatus = toShopifyShipmentStatus(resolvedStatus);
+    let shopifyPushed = false;
+    let shopifyError: string | undefined;
+    if (shipmentStatus) {
+      try {
+        const push = await pushShopifyShipmentStatus(
+          order.shopifyOrderId,
+          shipmentStatus,
+          {
+            trackingNumber: order.trackingNumber,
+            happenedAt: deliveredTimestamp || undefined,
+          }
+        );
+        shopifyPushed = push.pushed;
+      } catch (err) {
+        shopifyError = err instanceof Error ? err.message : "Shopify push failed";
+        console.error(
+          `Shopify shipment status push failed for ${order.trackingNumber}:`,
+          shopifyError
+        );
+      }
+    }
+
+    return NextResponse.json({
+      success: true,
+      status: resolvedStatus,
+      shopifyPushed,
+      ...(shopifyError ? { shopifyError } : {}),
+    });
   } catch (error) {
     console.error("Single order refresh error:", error);
     return NextResponse.json(

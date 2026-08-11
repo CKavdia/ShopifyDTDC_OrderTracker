@@ -1055,11 +1055,13 @@ function OrderTableDark({ orders, onOrderUpdated, delayThresholdDays, shippingCo
   const handleDeliveredToCustomer = async (orderId: string) => {
     setActionLoading(`delivered-to-customer-${orderId}`);
     try {
-      await fetch(`/api/orders/${orderId}/status`, {
+      const res = await fetch(`/api/orders/${orderId}/status`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ deliveryStatus: "Delivered" }),
       });
+      const json = await res.json().catch(() => ({}));
+      if (json?.shopifyWarning) alert(json.shopifyWarning);
       onOrderUpdated?.();
     } finally {
       setActionLoading(null);
@@ -1080,6 +1082,7 @@ function OrderTableDark({ orders, onOrderUpdated, delayThresholdDays, shippingCo
         alert(`Status update failed: ${json?.error || res.statusText}`);
         return;
       }
+      if (json?.shopifyWarning) alert(json.shopifyWarning);
       onOrderUpdated?.();
     } finally {
       setActionLoading(null);
@@ -1498,6 +1501,9 @@ Thank you! ${E.heart}
       if (!data.success) {
         alert(`Refresh failed: ${data.error}`);
         return;
+      }
+      if (data.shopifyError) {
+        alert(`Tracking updated, but Shopify was not: ${data.shopifyError}`);
       }
       onOrderUpdated?.();
     } finally {
@@ -2999,7 +3005,7 @@ export default function DashboardCommandCenter() {
       if (data.success) {
         setMessage({
           type: "success",
-          text: `Refreshed ${data.refreshed} orders${data.errors ? ` (${data.errors} errors)` : ""}`,
+          text: `Refreshed ${data.refreshed} orders${data.shopifyPushed ? `, ${data.shopifyPushed} synced to Shopify` : ""}${data.errors ? ` (${data.errors} errors)` : ""}`,
         });
         setLastRefreshed(new Date().toLocaleTimeString());
         fetchOrders();

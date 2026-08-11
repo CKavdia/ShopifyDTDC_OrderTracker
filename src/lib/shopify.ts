@@ -1,4 +1,4 @@
-import type { AbandonedCheckout } from "./data/types";
+import type { AbandonedCheckout, DeliveryStatus } from "./data/types";
 
 const STORE_URL = process.env.SHOPIFY_STORE_URL!;
 const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID!;
@@ -557,6 +557,153 @@ async function updateExistingFulfillmentTracking(
       },
     },
   });
+}
+
+// --- Shipment status push -------------------------------------------------
+// DTDC is the source of truth for where the parcel is, but Shopify only learns
+// about it if we tell it. A FulfillmentEvent sets the fulfillment's shipment
+// status, which is what drives the "Delivery status" column in the Shopify
+// orders list and the customer's order status page.
+
+export type ShipmentStatus = "OUT_FOR_DELIVERY" | "DELIVERED";
+
+// Only these two internal statuses are mirrored to Shopify. RTO/return states
+// are deliberately left alone — Shopify has no matching concept and a wrong
+// event is visible to the customer.
+export function toShopifyShipmentStatus(
+  deliveryStatus: DeliveryStatus
+): ShipmentStatus | null {
+  if (deliveryStatus === "Delivered") return "DELIVERED";
+  if (deliveryStatus === "Out for Delivery") return "OUT_FOR_DELIVERY";
+  return null;
+}
+
+// How far along the shipment Shopify already thinks the parcel is. Only ever
+// push forward — this makes repeated refreshes a no-op and stops a late DTDC
+// "out for delivery" scan from walking back an already-delivered fulfillment.
+const SHIPMENT_RANK: Record<string, number> = {
+  IN_TRANSIT: 1,
+  CARRIER_PICKED_UP: 1,
+  OUT_FOR_DELIVERY: 2,
+  DELIVERED: 3,
+};
+
+const FULFILLMENTS_QUERY = `
+  query OrderFulfillments($id: ID!) {
+    order(id: $id) {
+      fulfillments(first: 20) {
+        id
+        status
+        displayStatus
+        trackingInfo(first: 5) {
+          number
+        }
+      }
+    }
+  }
+`;
+
+const FULFILLMENT_EVENT_MUTATION = `
+  mutation PushShipmentStatus($fulfillmentEvent: FulfillmentEventInput!) {
+    fulfillmentEventCreate(fulfillmentEvent: $fulfillmentEvent) {
+      fulfillmentEvent {
+        id
+        status
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
+// DTDC hands back IST wall-clock with no offset ("2026-03-24 18:00:00[.0]"),
+// so `new Date(raw)` resolves against whatever timezone the host runs in —
+// correct on an IST desktop, 5h30m into the future on a UTC server. Pin the
+// offset explicitly so the timestamp the customer sees is host-independent.
+function toIsoFromDtdc(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  const hasZone = /(?:Z|[+-]\d{2}:?\d{2})$/.test(trimmed);
+  // deliveredDate can be date-only; without a time part the offset suffix
+  // alone is unparseable, so give it midnight IST rather than dropping it.
+  const base = /^\d{4}-\d{2}-\d{2}$/.test(trimmed)
+    ? `${trimmed}T00:00:00`
+    : trimmed.replace(" ", "T").replace(/\.\d+$/, "");
+  const parsed = new Date(hasZone ? trimmed : `${base}+05:30`);
+  return isNaN(parsed.getTime()) ? undefined : parsed.toISOString();
+}
+
+export async function pushShopifyShipmentStatus(
+  shopifyOrderId: string,
+  target: ShipmentStatus,
+  opts?: { trackingNumber?: string; happenedAt?: string }
+): Promise<{ pushed: boolean; reason?: string }> {
+  // Not every row in the tracker is a Shopify order (manual entries exist).
+  if (!shopifyOrderId) {
+    return { pushed: false, reason: "no Shopify order id" };
+  }
+
+  const result = await shopifyGraphQL<{
+    order: {
+      fulfillments: Array<{
+        id: string;
+        status: string;
+        displayStatus: string | null;
+        trackingInfo: Array<{ number: string | null }>;
+      }>;
+    } | null;
+  }>(FULFILLMENTS_QUERY, { id: `gid://shopify/Order/${shopifyOrderId}` });
+
+  const fulfillments = result.order?.fulfillments || [];
+  if (fulfillments.length === 0) {
+    return { pushed: false, reason: "no fulfillment on Shopify order" };
+  }
+
+  // Ignore cancelled/failed fulfillments — an order re-fulfilled with the same
+  // AWB carries the number on both, and posting an event to the dead one just
+  // returns userErrors. Match on the AWB within the live ones so split
+  // shipments update the right parcel.
+  const live = fulfillments.filter((f) => f.status === "SUCCESS");
+  const candidates = live.length > 0 ? live : fulfillments;
+  const targetFulfillment =
+    (opts?.trackingNumber
+      ? candidates.find((f) =>
+          f.trackingInfo.some((t) => t.number === opts.trackingNumber)
+        )
+      : undefined) || candidates[candidates.length - 1];
+
+  const currentRank = SHIPMENT_RANK[targetFulfillment.displayStatus || ""] || 0;
+  if (SHIPMENT_RANK[target] <= currentRank) {
+    return {
+      pushed: false,
+      reason: `already at ${targetFulfillment.displayStatus}`,
+    };
+  }
+
+  const happenedAt = toIsoFromDtdc(opts?.happenedAt);
+
+  const mutation = await shopifyGraphQL<{
+    fulfillmentEventCreate: {
+      userErrors: Array<{ field: string[] | null; message: string }>;
+    };
+  }>(FULFILLMENT_EVENT_MUTATION, {
+    fulfillmentEvent: {
+      fulfillmentId: targetFulfillment.id,
+      status: target,
+      ...(happenedAt ? { happenedAt } : {}),
+    },
+  });
+
+  const userErrors = mutation.fulfillmentEventCreate?.userErrors || [];
+  if (userErrors.length > 0) {
+    throw new Error(
+      `fulfillmentEventCreate failed: ${userErrors.map((e) => e.message).join("; ")}`
+    );
+  }
+
+  return { pushed: true };
 }
 
 export async function getOrderLineItems(
