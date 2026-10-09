@@ -21,3 +21,10 @@ npm-debug.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# scratch outputs
+/*.txt
+/*.pdf
+
+# claude local settings
+.claude/settings.local.json
