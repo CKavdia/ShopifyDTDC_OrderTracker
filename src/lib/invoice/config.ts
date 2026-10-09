@@ -54,6 +54,18 @@ export const DEFAULT_GST = {
 // taxable service line. Confirm with your CA.
 export const SHIPPING_GST_RATE = 18;
 
+// Conditional (threshold) offers whose entitlement breaks when goods are
+// returned. Key = a case-insensitive substring of the discount's Shopify
+// title (automatic offers) or code (code-based offers); value = the minimum
+// number of pieces that must REMAIN on the order for the offer to stand.
+// When a CLOSED return drops the remaining pieces below the threshold, the
+// offer is revoked and every line prints at its full (pre-discount) price —
+// e.g. "BUY MORE - 10% OFF" needs 2 kept pieces: buy 2, return 1, the kept
+// piece bills at full price.
+export const CONDITIONAL_OFFERS: Record<string, number> = {
+  "BUY MORE": 2,
+};
+
 // The store's home state — decides intra-state (CGST+SGST) vs inter-state (IGST).
 export const HOME_STATE_CODE = "RJ";
 export const HOME_STATE_NAME = "Rajasthan";

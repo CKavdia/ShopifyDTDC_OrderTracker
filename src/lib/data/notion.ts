@@ -10,12 +10,20 @@ import {
   RtoConfirmationStatus,
   InvoiceLogInput,
   InvoiceRecord,
+  InvoicePriceOverride,
+  InvoiceLineSnapshot,
+  WholesaleInvoiceInput,
+  RenumberChange,
 } from "./types";
+import { parseInvoicePdf, parsedItemsToSnapshot } from "../invoice/parse";
+import { compressPdfForUpload } from "../invoice/compress.server";
+import { stampInvoiceNumber } from "../invoice/stamp.server";
 import {
   financialYear,
   formatInvoiceNo,
   parseSequence,
 } from "../invoice/numbering";
+import { GST_STATE_CODES, GST_STATE_NAMES } from "../invoice/config";
 
 const NOTION_API = "https://api.notion.com/v1";
 const NOTION_VERSION = "2022-06-28";
@@ -1482,8 +1490,9 @@ export const notionProvider: DataProvider = {
     // Serialize so two concurrent generations can't grab the same number.
     // (Single Next.js server + single admin -> an in-process lock is enough;
     // Notion has no cross-process transactions.)
-    invoiceMutex = invoiceMutex.then(() => assignInvoiceNumber(input));
-    return invoiceMutex;
+    const p = invoiceMutex.then(() => assignInvoiceNumber(input));
+    invoiceMutex = p;
+    return p;
   },
 
   getInvoiceStartNumber(fy: string) {
@@ -1496,6 +1505,317 @@ export const notionProvider: DataProvider = {
 
   getMaxInvoiceSequence(fy: string) {
     return getMaxInvoiceSequence(fy);
+  },
+
+  getInvoiceHideCodFee() {
+    return getFlagRow(HIDE_COD_FEE_PROP).then(
+      (v) => v ?? DEFAULT_HIDE_COD_FEE
+    );
+  },
+
+  setInvoiceHideCodFee(hide: boolean) {
+    return setFlagRow(HIDE_COD_FEE_PROP, hide);
+  },
+
+  async getInvoicePriceOverride(
+    shopifyOrderId
+  ): Promise<InvoicePriceOverride | null> {
+    const dbId = await getInvoicesDatabaseId();
+    const rows = await queryDatabase(dbId, {
+      property: "Shopify Order ID",
+      rich_text: { equals: shopifyOrderId },
+    });
+    if (rows.length === 0) return null;
+    const props = (rows[0] as { properties: Record<string, unknown> }).properties;
+    return readPriceOverride(props);
+  },
+
+  // Overwrite the frozen line-item snapshot on a ledger row (backfill / fixes).
+  async setInvoiceLineItems(
+    pageId: string,
+    lines: InvoiceLineSnapshot[]
+  ): Promise<void> {
+    const dbId = await getInvoicesDatabaseId();
+    await ensureInvoiceTypeProps(dbId);
+    await patchLineItems(pageId, lines);
+  },
+
+  async setInvoicePriceOverride(
+    shopifyOrderId: string,
+    o: InvoicePriceOverride | null
+  ): Promise<void> {
+    const dbId = await getInvoicesDatabaseId();
+    await ensurePriceOverrideProps(dbId);
+    const rows = await queryDatabase(dbId, {
+      property: "Shopify Order ID",
+      rich_text: { equals: shopifyOrderId },
+    });
+    if (rows.length === 0)
+      throw new Error(`No invoice ledger row for order ${shopifyOrderId}`);
+    const pageId = (rows[0] as { id: string }).id;
+    const res = await fetch(`${NOTION_API}/pages/${pageId}`, {
+      method: "PATCH",
+      headers: headers(),
+      body: JSON.stringify({
+        properties: {
+          [PRICE_OVERRIDE_PROP]: {
+            rich_text: o ? [{ text: { content: JSON.stringify(o) } }] : [],
+          },
+        },
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`Failed to save price override: ${err.slice(0, 200)}`);
+    }
+  },
+
+  // Record a wholesale invoice issued outside the tool, then re-order the
+  // unfiled part of the series so every invoice number follows date order.
+  // The PDF (if supplied) is attached to the row for the record.
+  async createWholesaleInvoice(
+    input: WholesaleInvoiceInput,
+    pdf?: { filename: string; data: Buffer }
+  ): Promise<{ pageId: string; invoiceNo: string; renumbered: RenumberChange[] }> {
+    // Serialize against concurrent retail numbering: the renumber walk and
+    // assignInvoiceNumber both read the same FY rows.
+    const p = invoiceMutex.then(async () => {
+      let attachError: string | undefined;
+      // Notion caps each uploaded file (free plan: 5 MiB); photo-heavy seller
+      // PDFs can exceed it, so recompress before the row is created — a
+      // failure here aborts cleanly before anything is recorded.
+      if (pdf) {
+        pdf = { ...pdf, data: await compressPdfForUpload(pdf.data) };
+      }
+      const dbId = await getInvoicesDatabaseId();
+      await ensureInvoiceTypeProps(dbId);
+
+      const fy = financialYear(new Date(`${input.invoiceDate}T12:00:00`));
+      const placeOfSupply = `${GST_STATE_CODES[input.stateCode] || "??"}-${GST_STATE_NAMES[input.stateCode] || ""}`;
+      const properties: Record<string, unknown> = {
+        // Renumbering below mints the real number; the empty title marks the
+        // just-added row (it sorts by date like any other).
+        "Invoice No": { title: [{ text: { content: "" } }] },
+        "Invoice Date": { date: { start: input.invoiceDate } },
+        Customer: { rich_text: [{ text: { content: input.customerName } }] },
+        "Place of Supply": { rich_text: [{ text: { content: placeOfSupply } }] },
+        "Taxable Value": { number: input.taxableValue },
+        CGST: { number: input.cgst },
+        SGST: { number: input.sgst },
+        IGST: { number: input.igst },
+        "Grand Total": { number: input.grandTotal },
+        FY: { rich_text: [{ text: { content: fy } }] },
+        Status: { select: { name: "Issued" } },
+        [TYPE_PROP]: { select: { name: TYPE_WHOLESALE } },
+        [QTY_PROP]: { number: input.quantity },
+      };
+      if (input.gstin.trim()) {
+        properties[GSTIN_PROP] = {
+          rich_text: [{ text: { content: input.gstin.trim().toUpperCase() } }],
+        };
+      }
+      if (input.hsn.trim()) {
+        properties[HSN_PROP] = {
+          rich_text: [{ text: { content: input.hsn.trim() } }],
+        };
+      }
+      if (input.reference) {
+        properties["Order Number"] = {
+          rich_text: [{ text: { content: input.reference } }],
+        };
+      }
+      const res = await fetch(`${NOTION_API}/pages`, {
+        method: "POST",
+        headers: headers(),
+        body: JSON.stringify({ parent: { database_id: dbId }, properties }),
+      });
+      if (!res.ok) {
+        const err = await res.text();
+        throw new Error(`Failed to create wholesale invoice row: ${err.slice(0, 200)}`);
+      }
+      const pageId = (await res.json()).id as string;
+
+      const renumberResult = await renumberUnfiled(fy);
+      const renumbered = renumberResult.changed;
+      if (renumberResult.errors.length > 0) {
+        const restampMsg = renumberResult.errors.join("; ");
+        attachError = attachError ? `${attachError}; restamp: ${restampMsg}` : restampMsg;
+      }
+      // Freeze the seller PDF's item table on the row — the issued invoice's
+      // lines become the source of truth for GSTR-1. Parse failure leaves the
+      // snapshot empty; stamping reports the read failure below.
+      let originalInvoiceNo = "";
+      let lineItems: InvoiceLineSnapshot[] = [];
+      if (pdf) {
+        try {
+          const parsed = await parseInvoicePdf(pdf.data);
+          originalInvoiceNo = parsed.originalInvoiceNo;
+          lineItems = parsedItemsToSnapshot(parsed.items);
+        } catch (e) {
+          console.error("Parsing the original PDF for the snapshot failed:", e);
+        }
+      }
+
+      // Read back the number the renumber pass gave this row — the re-issued
+      // PDF must print exactly that number.
+      const rows = await queryDatabase(dbId, {
+        property: "FY",
+        rich_text: { equals: fy },
+      });
+      const mine = rows.find((r) => (r as { id: string }).id === pageId);
+      const titleProp = ((mine as { properties?: Record<string, unknown> })
+        ?.properties?.["Invoice No"] ?? {}) as {
+        title?: Array<{ plain_text: string }>;
+      };
+      const invoiceNo = titleProp.title?.[0]?.plain_text || "";
+
+      // Snapshot: written even when an attachment below fails — the frozen
+      // lines are what GSTR-1 trusts.
+      try {
+        await patchLineItems(pageId, lineItems);
+      } catch (e) {
+        console.error("Line-item snapshot write failed:", e);
+      }
+
+      // Attachments: the seller's original goes to "Original PDF" for audit;
+      // a stamped copy — our UN/FY number drawn over the original's — goes to
+      // "Invoice PDF". The row stands even if either attachment fails — the
+      // error is reported to the caller so the dialog can flag it.
+      if (pdf) {
+        try {
+          await attachInvoicePdf(pageId, ORIG_PDF_PROP, pdf.filename, pdf.data);
+        } catch (e) {
+          attachError = `original: ${e instanceof Error ? e.message : String(e)}`;
+          console.error("Original PDF attachment failed:", e);
+        }
+        try {
+          if (!originalInvoiceNo) {
+            throw new Error("could not read the original invoice number from the PDF");
+          }
+          const stamped = await stampInvoiceNumber(
+            pdf.data,
+            originalInvoiceNo,
+            invoiceNo
+          );
+          await attachInvoicePdf(
+            pageId,
+            PDF_PROP,
+            `invoice-${invoiceNo.replace(/\//g, "-")}.pdf`,
+            stamped.bytes
+          );
+        } catch (e) {
+          // No stamped copy — put the untouched original on "Invoice PDF" so
+          // the row still opens to a document.
+          const msg = e instanceof Error ? e.message : String(e);
+          attachError = attachError
+            ? `${attachError}; stamped copy: ${msg}`
+            : `stamped copy: ${msg}`;
+          console.error("Stamping the original PDF failed:", e);
+          if (pdf) {
+            try {
+              await attachInvoicePdf(pageId, PDF_PROP, pdf.filename, pdf.data);
+            } catch (e2) {
+              console.error("Fallback original attachment failed:", e2);
+            }
+          }
+        }
+      }
+
+      return {
+        pageId,
+        invoiceNo,
+        renumbered,
+        attachError,
+      };
+    });
+    invoiceMutex = p;
+    return p;
+  },
+
+  async setInvoiceFiled(pageId: string, filed: boolean): Promise<void> {
+    const dbId = await getInvoicesDatabaseId();
+    await ensureInvoiceTypeProps(dbId);
+    const res = await fetch(`${NOTION_API}/pages/${pageId}`, {
+      method: "PATCH",
+      headers: headers(),
+      body: JSON.stringify({ properties: { [FILED_PROP]: { checkbox: filed } } }),
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`Failed to save filed flag: ${err.slice(0, 200)}`);
+    }
+  },
+
+  // Attach (or re-attach) the seller's original PDF on an existing ledger row.
+  async attachWholesalePdf(
+    pageId: string,
+    filename: string,
+    pdfData: Buffer
+  ): Promise<void> {
+    await attachInvoicePdf(pageId, ORIG_PDF_PROP, filename, await compressPdfForUpload(pdfData));
+  },
+
+  // Stamp the row's UN/FY number over the seller-software number in the
+  // original PDF: the document stays byte-for-byte the seller's except for
+  // that one line of text, so the printed number matches the filed series.
+  // The untouched original moves to "Original PDF"; the stamped copy replaces
+  // whatever sat in "Invoice PDF".
+  async regenerateWholesalePdf(pageId: string): Promise<{ invoiceNo: string }> {
+    await ensureInvoiceTypeProps(await getInvoicesDatabaseId());
+    const pageRes = await fetch(`${NOTION_API}/pages/${pageId}`, { headers: headers() });
+    if (!pageRes.ok) {
+      throw new Error(`Failed to read ledger row (${pageRes.status}).`);
+    }
+    const props = ((await pageRes.json()) as { properties?: Record<string, unknown> })
+      .properties ?? {};
+    const title = (props["Invoice No"] as { title?: Array<{ plain_text: string }> })
+      ?.title?.[0]?.plain_text || "";
+    if (!title) throw new Error("Row has no invoice number yet — save it via upload first.");
+
+    const files = (key: string) =>
+      (props[key] as {
+        files?: Array<{ type: string; file?: { url?: string }; external?: { url?: string } }>;
+      })?.files || [];
+    const fileUrl = (key: string) =>
+      files(key).map((f) => f.file?.url || f.external?.url || "").find(Boolean) || "";
+
+    // The seller's original: prefer "Original PDF", fall back to a PDF still
+    // sitting in "Invoice PDF" (pre-regeneration rows).
+    const origUrl = fileUrl(ORIG_PDF_PROP) || fileUrl(PDF_PROP);
+    if (!origUrl) {
+      throw new Error(
+        "No original PDF on this row — use 'Attach PDF' to upload the seller's invoice first."
+      );
+    }
+    const buf = await compressPdfForUpload(
+      Buffer.from(await (await fetch(origUrl)).arrayBuffer())
+    );
+    const parsed = await parseInvoicePdf(buf);
+    const originalNo =
+      parsed.originalInvoiceNo ||
+      (props["Order Number"] as { rich_text?: Array<{ plain_text: string }> })
+        ?.rich_text?.map((b) => b.plain_text).join("").trim() ||
+      "";
+    if (!originalNo) {
+      throw new Error(
+        "Could not read the original invoice number from the PDF — nothing stamped."
+      );
+    }
+    const stamped = await stampInvoiceNumber(buf, originalNo, title);
+
+    // Move the untouched original to its own property first (skipped when it
+    // already lives there), then replace "Invoice PDF" with the stamped copy —
+    // a failure here leaves the original in place, never lost.
+    if (fileUrl(ORIG_PDF_PROP) !== origUrl) {
+      await attachInvoicePdf(pageId, ORIG_PDF_PROP, "original.pdf", buf);
+    }
+    await attachInvoicePdf(
+      pageId,
+      PDF_PROP,
+      `invoice-${title.replace(/\//g, "-")}.pdf`,
+      stamped.bytes
+    );
+    return { invoiceNo: title };
   },
 
   async listInvoices(): Promise<InvoiceRecord[]> {
@@ -1517,7 +1837,25 @@ export const notionProvider: DataProvider = {
         (props["Invoice Date"] as { date?: { start: string } | null })?.date?.start || "";
       const select =
         (props["Status"] as { select?: { name: string } | null })?.select?.name || "";
+      const type =
+        (props[TYPE_PROP] as { select?: { name: string } | null })?.select?.name ===
+        TYPE_WHOLESALE
+          ? "wholesale"
+          : "retail";
+      const filed =
+        (props[FILED_PROP] as { checkbox?: boolean | null })?.checkbox === true;
+      const pdfFiles = (props[PDF_PROP] as {
+        files?: Array<{ type: string; file?: { url?: string }; external?: { url?: string } }>;
+      })?.files || [];
+      const pdfUrl =
+        pdfFiles.map((f) => f.file?.url || f.external?.url || "").find(Boolean) || "";
+      const origFiles = (props[ORIG_PDF_PROP] as {
+        files?: Array<{ type: string; file?: { url?: string }; external?: { url?: string } }>;
+      })?.files || [];
+      const origPdfUrl =
+        origFiles.map((f) => f.file?.url || f.external?.url || "").find(Boolean) || "";
       return {
+        pageId: (row as { id: string }).id,
         invoiceNo: title,
         shopifyOrderId: text("Shopify Order ID"),
         orderNumber: text("Order Number"),
@@ -1531,6 +1869,15 @@ export const notionProvider: DataProvider = {
         grandTotal: num("Grand Total"),
         fy: text("FY"),
         status: select,
+        type,
+        filed,
+        hsn: text(HSN_PROP),
+        quantity: num(QTY_PROP),
+        gstin: text(GSTIN_PROP),
+        pdfUrl,
+        origPdfUrl,
+        priceOverride: readPriceOverride(props),
+        lineItems: readLineItems(props),
       };
     });
   },
@@ -1539,8 +1886,9 @@ export const notionProvider: DataProvider = {
 // --- Invoices database (numbering + log) ----------------------------------
 
 let cachedInvoicesDbId: string | null = null;
-let invoiceMutex: Promise<{ invoiceNo: string; reused: boolean }> =
-  Promise.resolve({ invoiceNo: "", reused: false });
+// One-number-at-a-time lock across retail minting and wholesale renumbering —
+// both walk the same FY rows. Holds whichever chained promise was queued last.
+let invoiceMutex: Promise<unknown> = Promise.resolve(null);
 
 const INVOICES_DB_TITLE = "UrbanNaari Invoices";
 
@@ -1583,6 +1931,8 @@ async function getInvoicesDatabaseId(): Promise<string> {
         IGST: { number: { format: "number" } },
         "Grand Total": { number: { format: "number" } },
         FY: { rich_text: {} },
+        "Forced Unit Price": { number: { format: "number" } },
+        "Forced GST Rate": { number: { format: "number" } },
         Status: {
           select: {
             options: [
@@ -1700,9 +2050,491 @@ async function setInvoiceStartNumber(fy: string, n: number): Promise<void> {
   }
 }
 
-// Highest invoice sequence already issued in a financial year (0 if none).
-async function getMaxInvoiceSequence(fy: string): Promise<number> {
+// --- Invoice display flags (global) --------------------------------------
+
+// Global flags live in the same settings DB as a special row whose title is
+// FLAGS_ROW, with the boolean in a "Hide COD Fee" checkbox property. The
+// property may not exist on databases created before the flag was introduced,
+// so it is added lazily on first write.
+const FLAGS_ROW = "_FLAGS_";
+const HIDE_COD_FEE_PROP = "Hide COD Fee";
+// Default: hide. The tool is requested to keep COD fees off invoices unless
+// the toggle is switched on.
+const DEFAULT_HIDE_COD_FEE = true;
+
+async function ensureCheckboxProperty(dbId: string, prop: string): Promise<void> {
+  const res = await fetch(`${NOTION_API}/databases/${dbId}`, { headers: headers() });
+  if (res.ok) {
+    const db = (await res.json()) as { properties?: Record<string, unknown> };
+    if (db.properties && db.properties[prop]) return;
+  }
+  const patchRes = await fetch(`${NOTION_API}/databases/${dbId}`, {
+    method: "PATCH",
+    headers: headers(),
+    body: JSON.stringify({ properties: { [prop]: { checkbox: {} } } }),
+  });
+  if (!patchRes.ok) {
+    const err = await patchRes.text();
+    throw new Error(`Failed to add "${prop}" to invoice settings: ${err.slice(0, 200)}`);
+  }
+}
+
+// Per-order price override lives on the invoices ledger row as one rich_text
+// property holding the JSON. Existing DBs predate it, so it is added lazily
+// on first write (same pattern as ensureCheckboxProperty).
+async function ensurePriceOverrideProps(dbId: string): Promise<void> {
+  const res = await fetch(`${NOTION_API}/databases/${dbId}`, { headers: headers() });
+  if (res.ok) {
+    const db = (await res.json()) as { properties?: Record<string, unknown> };
+    if (db.properties && db.properties[PRICE_OVERRIDE_PROP]) return;
+  }
+  const patchRes = await fetch(`${NOTION_API}/databases/${dbId}`, {
+    method: "PATCH",
+    headers: headers(),
+    body: JSON.stringify({
+      properties: { [PRICE_OVERRIDE_PROP]: { rich_text: {} } },
+    }),
+  });
+  if (!patchRes.ok) {
+    const err = await patchRes.text();
+    throw new Error(`Failed to add price override prop to invoices DB: ${err.slice(0, 200)}`);
+  }
+}
+
+const PRICE_OVERRIDE_PROP = "Forced Prices";
+// Frozen invoice lines (JSON snapshot) — the issued invoice is the source of
+// truth; GSTR-1 reads this instead of rebuilding from Shopify.
+const LINES_PROP = "Line Items";
+
+// Rich text blocks cap at 2000 chars each — split long JSON across them.
+function richTextChunks(text: string): Array<{ text: { content: string } }> {
+  const out: Array<{ text: { content: string } }> = [];
+  for (let i = 0; i < text.length; i += 2000)
+    out.push({ text: { content: text.slice(i, i + 2000) } });
+  return out;
+}
+
+function readLineItems(
+  props: Record<string, unknown>
+): InvoiceLineSnapshot[] | undefined {
+  const raw =
+    (props[LINES_PROP] as { rich_text?: Array<{ plain_text: string }> })
+      ?.rich_text?.map((b) => b.plain_text)
+      .join("") || "";
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed as InvoiceLineSnapshot[];
+  } catch {
+    // Unreadable snapshot — treated as absent, callers fall back to a rebuild.
+  }
+  return undefined;
+}
+
+async function patchLineItems(
+  pageId: string,
+  lines: InvoiceLineSnapshot[]
+): Promise<void> {
+  const res = await fetch(`${NOTION_API}/pages/${pageId}`, {
+    method: "PATCH",
+    headers: headers(),
+    body: JSON.stringify({
+      properties: {
+        [LINES_PROP]: {
+          rich_text: lines.length ? richTextChunks(JSON.stringify(lines)) : [],
+        },
+      },
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Failed to save line items: ${err.slice(0, 200)}`);
+  }
+}
+
+// Wholesale-upload props (added lazily — the DB predates the feature).
+const TYPE_PROP = "Type";
+const TYPE_RETAIL = "Retail";
+const TYPE_WHOLESALE = "Wholesale";
+const FILED_PROP = "Filed";
+const PDF_PROP = "Invoice PDF";
+const ORIG_PDF_PROP = "Original PDF";
+const HSN_PROP = "HSN";
+const GSTIN_PROP = "Buyer GSTIN";
+const QTY_PROP = "Total Qty";
+
+async function ensureInvoiceTypeProps(dbId: string): Promise<void> {
+  const res = await fetch(`${NOTION_API}/databases/${dbId}`, { headers: headers() });
+  if (res.ok) {
+    const db = (await res.json()) as { properties?: Record<string, unknown> };
+    if (
+      db.properties &&
+      db.properties[TYPE_PROP] &&
+      db.properties[FILED_PROP] &&
+      db.properties[PDF_PROP] &&
+      db.properties[ORIG_PDF_PROP] &&
+      db.properties[HSN_PROP] &&
+      db.properties[GSTIN_PROP] &&
+      db.properties[QTY_PROP] &&
+      db.properties[LINES_PROP]
+    )
+      return;
+  }
+  const patchRes = await fetch(`${NOTION_API}/databases/${dbId}`, {
+    method: "PATCH",
+    headers: headers(),
+    body: JSON.stringify({
+      properties: {
+        [TYPE_PROP]: {
+          select: {
+            options: [
+              { name: TYPE_RETAIL, color: "blue" },
+              { name: TYPE_WHOLESALE, color: "purple" },
+            ],
+          },
+        },
+        [FILED_PROP]: { checkbox: {} },
+        [PDF_PROP]: { files: {} },
+        [ORIG_PDF_PROP]: { files: {} },
+        [HSN_PROP]: { rich_text: {} },
+        [GSTIN_PROP]: { rich_text: {} },
+        [QTY_PROP]: { number: {} },
+        [LINES_PROP]: { rich_text: {} },
+      },
+    }),
+  });
+  if (!patchRes.ok) {
+    const err = await patchRes.text();
+    throw new Error(`Failed to add wholesale props to invoices DB: ${err.slice(0, 200)}`);
+  }
+}
+
+// Re-issue numbers for every unfiled invoice in a financial year so the whole
+// series reads in date order (GST requirement). Filed rows are anchors — their
+// numbers can never move, so the walk aborts if they would break the order.
+// Wholesale rows whose number moves also need their stamped PDF re-drawn over
+// the original — failures there are reported, never fatal to the walk.
+async function renumberUnfiled(fy: string): Promise<{
+  changed: RenumberChange[];
+  errors: string[];
+}> {
   const dbId = await getInvoicesDatabaseId();
+  const rows = await queryDatabase(dbId, {
+    property: "FY",
+    rich_text: { equals: fy },
+  });
+
+  interface Row {
+    pageId: string;
+    invoiceNo: string;
+    seq: number;
+    date: string; // YYYY-MM-DD prefix of the Notion date
+    filed: boolean;
+    customerName: string;
+    isWholesale: boolean;
+    hasOrigPdf: boolean;
+  }
+  const list: Row[] = rows.map((row) => {
+    const props = (row as { properties: Record<string, unknown> }).properties;
+    const invoiceNo =
+      (props["Invoice No"] as { title?: Array<{ plain_text: string }> })
+        ?.title?.[0]?.plain_text || "";
+    return {
+      pageId: (row as { id: string }).id,
+      invoiceNo,
+      seq: parseSequence(invoiceNo),
+      date: ((props["Invoice Date"] as { date?: { start: string | null } })?.date?.start || "").slice(0, 10),
+      filed:
+        (props[FILED_PROP] as { checkbox?: boolean | null })?.checkbox === true,
+      customerName:
+        (props["Customer"] as { rich_text?: Array<{ plain_text: string }> })
+          ?.rich_text?.map((b) => b.plain_text).join("") || "",
+      isWholesale:
+        (props[TYPE_PROP] as { select?: { name: string } | null })?.select
+          ?.name === TYPE_WHOLESALE,
+      hasOrigPdf:
+        ((props[ORIG_PDF_PROP] as { files?: unknown[] })?.files?.length ?? 0) > 0,
+    };
+  });
+
+  list.sort((a, b) => (a.date === b.date ? a.seq - b.seq : a.date < b.date ? -1 : 1));
+
+  const claimed = new Set(list.filter((r) => r.filed).map((r) => r.seq));
+  // Numbers never go below the per-FY floor (the configured start number, or
+  // the series' own lowest existing number) — renumbering shifts rows within
+  // the series, it never drags the whole series back to 1.
+  const minExisting = Math.min(
+    ...list.filter((r) => r.seq > 0).map((r) => r.seq)
+  );
+  const floor =
+    (await getInvoiceStartNumber(fy)) ??
+    (Number.isFinite(minExisting) && minExisting > 0 ? minExisting : 1);
+  const changed: RenumberChange[] = [];
+  const errors: string[] = [];
+  let prevAnchor = 0; // last filed number seen — anchors rise with date
+  let prevAssigned = floor - 1; // highest number handed out so far
+
+  for (const [i, r] of list.entries()) {
+    if (r.filed) {
+      if (r.seq <= prevAnchor) {
+        throw new Error(
+          `Filed invoices ${r.invoiceNo} and an earlier one are out of date ` +
+            `order, so the series cannot be re-sorted. Numbers on filed ` +
+            `invoices cannot change.`
+        );
+      }
+      prevAnchor = r.seq;
+      prevAssigned = Math.max(prevAssigned, r.seq);
+      continue;
+    }
+    // The next filed anchor (if any) caps what this row can take.
+    let nextAnchorCap = Infinity;
+    for (let j = i + 1; j < list.length; j++) {
+      if (list[j].filed) {
+        nextAnchorCap = list[j].seq;
+        break;
+      }
+    }
+    let next = Math.max(prevAssigned, prevAnchor) + 1;
+    while (next < nextAnchorCap && claimed.has(next)) next++;
+    if (next >= nextAnchorCap) {
+      throw new Error(
+        `No free invoice number between #${prevAnchor} and #${nextAnchorCap} ` +
+          `for ${r.invoiceNo || "the new invoice"} (dated ${r.date}) — ` +
+          `that gap belongs to already-filed invoices. Date the upload after ` +
+          `the last filed invoice, or un-file that month first.`
+      );
+    }
+    const newNo = formatInvoiceNo(fy, next);
+    if (newNo !== r.invoiceNo) {
+      const res = await fetch(`${NOTION_API}/pages/${r.pageId}`, {
+        method: "PATCH",
+        headers: headers(),
+        body: JSON.stringify({
+          properties: {
+            "Invoice No": { title: [{ text: { content: newNo } }] },
+          },
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.text();
+        throw new Error(`Failed to renumber ${r.invoiceNo || "(new)"}: ${err.slice(0, 200)}`);
+      }
+      changed.push({
+        oldNo: r.invoiceNo,
+        invoiceNo: newNo,
+        invoiceDate: r.date,
+        customerName: r.customerName,
+      });
+      // The stamp must print the number the ledger now carries, or the merged
+      // export shows the same printed number twice (this stale stamp + whoever
+      // holds that number now). Report — never abort the walk.
+      if (r.isWholesale) {
+        if (!r.hasOrigPdf) {
+          errors.push(`${newNo}: no Original PDF on the row — restamp skipped`);
+        } else {
+          try {
+            await restampWholesalePdf(r.pageId, newNo);
+          } catch (e) {
+            errors.push(
+              `${newNo}: restamp failed — ${e instanceof Error ? e.message : String(e)}`
+            );
+          }
+        }
+      }
+    }
+    prevAssigned = next;
+  }
+  return { changed, errors };
+}
+
+// Re-stamp a wholesale row's "Invoice PDF" after renumbering moved its number.
+// Stamps only from "Original PDF": a fallback "Invoice PDF" copy may already
+// carry an old stamp, which would survive as a ghost second number.
+async function restampWholesalePdf(pageId: string, newNo: string): Promise<void> {
+  const pageRes = await fetch(`${NOTION_API}/pages/${pageId}`, {
+    headers: headers(),
+  });
+  if (!pageRes.ok) throw new Error(`row read failed (${pageRes.status})`);
+  const props =
+    ((await pageRes.json()) as { properties?: Record<string, unknown> })
+      .properties ?? {};
+  const origUrl = (
+    props[ORIG_PDF_PROP] as {
+      files?: Array<{ file?: { url?: string }; external?: { url?: string } }>;
+    }
+  )?.files
+    ?.map((f) => f.file?.url || f.external?.url || "")
+    .find(Boolean);
+  if (!origUrl) throw new Error("no Original PDF attached");
+  const buf = await compressPdfForUpload(
+    Buffer.from(await (await fetch(origUrl)).arrayBuffer())
+  );
+  const parsed = await parseInvoicePdf(buf);
+  if (!parsed.originalInvoiceNo) {
+    throw new Error("could not read the original invoice number from the PDF");
+  }
+  const stamped = await stampInvoiceNumber(
+    buf,
+    parsed.originalInvoiceNo,
+    newNo
+  );
+  await attachInvoicePdf(
+    pageId,
+    PDF_PROP,
+    `invoice-${newNo.replace(/\//g, "-")}.pdf`,
+    stamped.bytes
+  );
+}
+
+// Attach a PDF to a ledger row's files property via Notion's file upload API
+// (single part — the tool rejects anything larger well before this).
+// `prop` picks the property: "Invoice PDF" (our re-issued PDF) or
+// "Original PDF" (the seller's).
+async function attachInvoicePdf(
+  pageId: string,
+  prop: string,
+  filename: string,
+  data: Buffer
+): Promise<void> {
+  const createRes = await fetch(`${NOTION_API}/file_uploads`, {
+    method: "POST",
+    headers: headers(),
+    body: JSON.stringify({
+      mode: "single_part",
+      filename,
+      content_type: "application/pdf",
+    }),
+  });
+  if (!createRes.ok) {
+    throw new Error(
+      `File upload init failed (${createRes.status}): ${(await createRes.text()).slice(0, 200)}`
+    );
+  }
+  const uploadId = ((await createRes.json()) as { id?: string }).id;
+
+  // Send takes multipart/form-data with a `file` field (JSON or raw-binary
+  // bodies are rejected). Content-Type must be dropped so fetch sets the
+  // multipart boundary itself.
+  const { "Content-Type": _drop, ...sendHeaders } = headers();
+  const fd = new FormData();
+  fd.append(
+    "file",
+    new Blob([new Uint8Array(data)], { type: "application/pdf" }),
+    filename
+  );
+  const sendRes = await fetch(`${NOTION_API}/file_uploads/${uploadId}/send`, {
+    method: "POST",
+    headers: sendHeaders,
+    body: fd,
+  });
+  if (!sendRes.ok) {
+    throw new Error(
+      `File upload send failed (${sendRes.status}): ${(await sendRes.text()).slice(0, 200)}`
+    );
+  }
+
+  const attachRes = await fetch(`${NOTION_API}/pages/${pageId}`, {
+    method: "PATCH",
+    headers: headers(),
+    body: JSON.stringify({
+      properties: {
+        [prop]: {
+          files: [{ type: "file_upload", file_upload: { id: uploadId } }],
+        },
+      },
+    }),
+  });
+  if (!attachRes.ok) {
+    throw new Error(
+      `File attach failed (${attachRes.status}): ${(await attachRes.text()).slice(0, 200)}`
+    );
+  }
+}
+
+// Parse the JSON override; fall back to the legacy single-price number props
+// ("Forced Unit Price"/"Forced GST Rate", written before per-line pricing)
+// rendered as a "*" wildcard line matching every goods line.
+function readPriceOverride(
+  props: Record<string, unknown>
+): InvoicePriceOverride | null {
+  const raw =
+    (props[PRICE_OVERRIDE_PROP] as { rich_text?: Array<{ plain_text: string }> })
+      ?.rich_text?.map((b) => b.plain_text)
+      .join("") || "";
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw) as InvoicePriceOverride;
+      if (
+        typeof parsed.gstRate === "number" &&
+        Array.isArray(parsed.lines) &&
+        parsed.lines.length > 0
+      )
+        return parsed;
+    } catch {
+      // fall through to legacy props
+    }
+  }
+  const unitPrice = (
+    props["Forced Unit Price"] as { number?: number | null } | undefined
+  )?.number;
+  const gstRate = (
+    props["Forced GST Rate"] as { number?: number | null } | undefined
+  )?.number;
+  if (typeof unitPrice === "number" && typeof gstRate === "number")
+    return { gstRate, lines: [{ key: "*", title: "", qty: 0, unitPrice }] };
+  return null;
+}
+
+async function getFlagRow(prop: string): Promise<boolean | null> {
+  const dbId = await getOrCreateInvoiceSettingsDbId();
+  const rows = await queryDatabase(dbId, {
+    property: "FY",
+    title: { equals: FLAGS_ROW },
+  });
+  if (rows.length === 0) return null;
+  const props = (rows[0] as { properties: Record<string, unknown> }).properties;
+  const v = (props[prop] as { checkbox?: boolean | null })?.checkbox;
+  return typeof v === "boolean" ? v : null;
+}
+
+async function setFlagRow(prop: string, value: boolean): Promise<void> {
+  const dbId = await getOrCreateInvoiceSettingsDbId();
+  await ensureCheckboxProperty(dbId, prop);
+  const rows = await queryDatabase(dbId, {
+    property: "FY",
+    title: { equals: FLAGS_ROW },
+  });
+  const properties = {
+    FY: { title: [{ text: { content: FLAGS_ROW } }] },
+    [prop]: { checkbox: value },
+  };
+  if (rows.length > 0) {
+    const pageId = (rows[0] as { id: string }).id;
+    const res = await fetch(`${NOTION_API}/pages/${pageId}`, {
+      method: "PATCH",
+      headers: headers(),
+      body: JSON.stringify({ properties }),
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`Failed to save invoice flag: ${err.slice(0, 200)}`);
+    }
+  } else {
+    const res = await fetch(`${NOTION_API}/pages`, {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({ parent: { database_id: dbId }, properties }),
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`Failed to save invoice flag: ${err.slice(0, 200)}`);
+    }
+  }
+}
+
+// Highest invoice sequence already issued in a financial year (0 if none).
+async function getMaxInvoiceSequence(fy: string): Promise<number> {  const dbId = await getInvoicesDatabaseId();
   const rows = await queryDatabase(dbId, {
     property: "FY",
     rich_text: { equals: fy },
@@ -1729,13 +2561,62 @@ async function assignInvoiceNumber(
     rich_text: { equals: input.shopifyOrderId },
   });
   if (existing.length > 0) {
+    const pageId = (existing[0] as { id: string }).id;
     const props = (existing[0] as { properties: Record<string, unknown> })
       .properties;
     const titleProp = props["Invoice No"] as {
       title?: Array<{ plain_text: string }>;
     };
     const invoiceNo = titleProp?.title?.[0]?.plain_text || "";
-    if (invoiceNo) return { invoiceNo, reused: true };
+    if (invoiceNo) {
+      // Regenerating after an order edit/return changes the figures — keep the
+      // ledger row in step with what the PDF now shows. Number and date stay.
+      const num = (k: string) =>
+        (props[k] as { number?: number | null })?.number ?? 0;
+      const patch: Record<string, unknown> = {};
+      if (num("Taxable Value") !== input.taxableValue)
+        patch["Taxable Value"] = { number: input.taxableValue };
+      if (num("CGST") !== input.cgst) patch["CGST"] = { number: input.cgst };
+      if (num("SGST") !== input.sgst) patch["SGST"] = { number: input.sgst };
+      if (num("IGST") !== input.igst) patch["IGST"] = { number: input.igst };
+      if (num("Grand Total") !== input.grandTotal)
+        patch["Grand Total"] = { number: input.grandTotal };
+      // Keep any price override (or its clearing) in step too.
+      const existingOverride = readPriceOverride(props);
+      if (JSON.stringify(existingOverride) !== JSON.stringify(input.priceOverride ?? null)) {
+        await ensurePriceOverrideProps(dbId);
+        patch[PRICE_OVERRIDE_PROP] = {
+          rich_text: input.priceOverride
+            ? [{ text: { content: JSON.stringify(input.priceOverride) } }]
+            : [],
+        };
+      }
+      // Refresh the frozen line snapshot so the row matches the PDF just built.
+      const existingLines = readLineItems(props);
+      if (
+        JSON.stringify(existingLines ?? null) !==
+        JSON.stringify(input.lineItems ?? null)
+      ) {
+        await ensureInvoiceTypeProps(dbId);
+        patch[LINES_PROP] = {
+          rich_text: input.lineItems?.length
+            ? richTextChunks(JSON.stringify(input.lineItems))
+            : [],
+        };
+      }
+      if (Object.keys(patch).length > 0) {
+        const res = await fetch(`${NOTION_API}/pages/${pageId}`, {
+          method: "PATCH",
+          headers: headers(),
+          body: JSON.stringify({ properties: patch }),
+        });
+        if (!res.ok) {
+          const err = await res.text();
+          throw new Error(`Failed to update invoice ledger totals: ${err.slice(0, 200)}`);
+        }
+      }
+      return { invoiceNo, reused: true };
+    }
   }
 
   // Next sequence within the current financial year.
@@ -1759,32 +2640,41 @@ async function assignInvoiceNumber(
   const nextSeq = Math.max(maxSeq, (start ?? 1) - 1) + 1;
   const invoiceNo = formatInvoiceNo(fy, nextSeq);
 
+  const newProps: Record<string, unknown> = {
+    "Invoice No": { title: [{ text: { content: invoiceNo } }] },
+    "Shopify Order ID": {
+      rich_text: [{ text: { content: input.shopifyOrderId } }],
+    },
+    "Order Number": {
+      rich_text: [{ text: { content: input.orderNumber } }],
+    },
+    "Invoice Date": { date: { start: input.invoiceDate } },
+    Customer: { rich_text: [{ text: { content: input.customerName } }] },
+    "Place of Supply": {
+      rich_text: [{ text: { content: input.placeOfSupply } }],
+    },
+    "Taxable Value": { number: input.taxableValue },
+    CGST: { number: input.cgst },
+    SGST: { number: input.sgst },
+    IGST: { number: input.igst },
+    "Grand Total": { number: input.grandTotal },
+    FY: { rich_text: [{ text: { content: fy } }] },
+    Status: { select: { name: "Issued" } },
+  };
+  if (input.priceOverride) {
+    // Databases created before overrides existed lack this prop — add first.
+    await ensurePriceOverrideProps(dbId);
+    newProps[PRICE_OVERRIDE_PROP] = {
+      rich_text: [{ text: { content: JSON.stringify(input.priceOverride) } }],
+    };
+  }
+
   await fetch(`${NOTION_API}/pages`, {
     method: "POST",
     headers: headers(),
     body: JSON.stringify({
       parent: { database_id: dbId },
-      properties: {
-        "Invoice No": { title: [{ text: { content: invoiceNo } }] },
-        "Shopify Order ID": {
-          rich_text: [{ text: { content: input.shopifyOrderId } }],
-        },
-        "Order Number": {
-          rich_text: [{ text: { content: input.orderNumber } }],
-        },
-        "Invoice Date": { date: { start: input.invoiceDate } },
-        Customer: { rich_text: [{ text: { content: input.customerName } }] },
-        "Place of Supply": {
-          rich_text: [{ text: { content: input.placeOfSupply } }],
-        },
-        "Taxable Value": { number: input.taxableValue },
-        CGST: { number: input.cgst },
-        SGST: { number: input.sgst },
-        IGST: { number: input.igst },
-        "Grand Total": { number: input.grandTotal },
-        FY: { rich_text: [{ text: { content: fy } }] },
-        Status: { select: { name: "Issued" } },
-      },
+      properties: newProps,
     }),
   });
 

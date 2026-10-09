@@ -257,6 +257,54 @@ export interface DataProvider {
   setInvoiceStartNumber(fy: string, n: number): Promise<void>;
   // Highest invoice sequence already issued in a financial year (0 if none).
   getMaxInvoiceSequence(fy: string): Promise<number>;
+  // Invoice display flags (global). hideCodFee drops the COD fee line from
+  // every generated invoice PDF.
+  getInvoiceHideCodFee(): Promise<boolean>;
+  setInvoiceHideCodFee(hide: boolean): Promise<void>;
+  // Per-order fixed-price override. Null clears it.
+  getInvoicePriceOverride(shopifyOrderId: string): Promise<InvoicePriceOverride | null>;
+  setInvoicePriceOverride(shopifyOrderId: string, o: InvoicePriceOverride | null): Promise<void>;
+  // Wholesale invoices issued outside the tool: log one, renumber the unfiled
+  // part of the series into date order, and (optionally) attach the PDF.
+  createWholesaleInvoice(
+    input: WholesaleInvoiceInput,
+    pdf?: { filename: string; data: Buffer }
+  ): Promise<{
+    pageId: string;
+    invoiceNo: string;
+    renumbered: RenumberChange[];
+    attachError?: string;
+  }>;
+  // Mark an invoice's GST return as filed (locks its number in place).
+  setInvoiceFiled(pageId: string, filed: boolean): Promise<void>;
+  // Attach the seller's original PDF to an existing row (files property
+  // "Original PDF").
+  attachWholesalePdf(pageId: string, filename: string, pdfData: Buffer): Promise<void>;
+  // Overwrite the frozen line-item snapshot on a ledger row (backfill and fixes;
+  // new invoices write it automatically at issue time).
+  setInvoiceLineItems(pageId: string, lines: InvoiceLineSnapshot[]): Promise<void>;
+  // Re-issue the tool's own PDF for a wholesale row (our UN/FY number on the
+  // face): backfills GSTIN/HSN from the seller's original when missing, moves
+  // the original to "Original PDF", and attaches ours to "Invoice PDF".
+  regenerateWholesalePdf(pageId: string): Promise<{ invoiceNo: string }>;
+}
+
+// One invoice line, frozen when the invoice is issued. GSTR-1, exports and
+// bookkeeping read this snapshot instead of rebuilding from Shopify, so later
+// order edits can never change what an issued invoice said. Wholesale uploads
+// freeze the item table parsed from the seller's original PDF.
+export interface InvoiceLineSnapshot {
+  hsn: string; // "" on the synthetic shipping/COD line
+  title: string;
+  variantTitle?: string;
+  qty: number;
+  rate: number; // GST rate %
+  taxableValue: number;
+  cgst: number;
+  sgst: number;
+  igst: number;
+  lineTotal: number; // tax-inclusive
+  service: boolean; // shipping/COD fee line (SAC 9968), vs goods
 }
 
 // Data needed to log an issued invoice in the Invoices database.
@@ -271,10 +319,32 @@ export interface InvoiceLogInput {
   sgst: number;
   igst: number;
   grandTotal: number;
+  // Fixed-price reissue (e.g. "unit price ₹2,499 + 5% GST"): persisted on the
+  // ledger row so every later regeneration and export reproduces it.
+  priceOverride?: InvoicePriceOverride | null;
+  // Frozen line items written to the row at issue time (see InvoiceLineSnapshot).
+  lineItems?: InvoiceLineSnapshot[];
+}
+
+// A per-order fixed-price override. Tax-EXCLUSIVE: each goods line prints its
+// forced unitPrice per piece and GST (gstRate %) is added on top. The lines
+// are matched by Shopify line-item id, so an override can price every line
+// independently; null = no override.
+export interface InvoicePriceOverrideLine {
+  key: string; // Shopify line-item id
+  title: string; // display only
+  qty: number;
+  unitPrice: number; // pre-tax, per piece
+}
+
+export interface InvoicePriceOverride {
+  gstRate: number; // percent, one rate for the whole invoice
+  lines: InvoicePriceOverrideLine[];
 }
 
 // A logged invoice as read back from the Invoices database.
 export interface InvoiceRecord {
+  pageId: string;
   invoiceNo: string;
   shopifyOrderId: string;
   orderNumber: string;
@@ -288,4 +358,43 @@ export interface InvoiceRecord {
   grandTotal: number;
   fy: string;
   status: string;
+  type: "retail" | "wholesale";
+  filed: boolean;
+  hsn: string; // wholesale uploads only — whole-invoice HSN for GSTR-1
+  quantity?: number; // wholesale uploads only — total goods qty for GSTR-1
+  gstin: string; // wholesale uploads only — buyer GSTIN, printed on the re-issued PDF
+  pdfUrl: string; // Notion attachment URL for our re-issued wholesale PDF, else ""
+  origPdfUrl: string; // Notion attachment URL for the seller's original PDF, else ""
+  priceOverride: InvoicePriceOverride | null;
+  lineItems?: InvoiceLineSnapshot[]; // frozen at issue time; absent on rows from before the snapshot existed
+}
+
+// A wholesale invoice issued outside the tool (paper / other software),
+// recorded here so it joins the same UN/FY series as retail invoices.
+export interface WholesaleInvoiceInput {
+  invoiceDate: string; // YYYY-MM-DD
+  customerName: string;
+  gstin: string;
+  stateCode: string; // key of GST_STATE_CODES, e.g. "DL"
+  hsn: string; // optional — the whole invoice's HSN, for the GSTR-1 summary
+  quantity: number; // total goods qty, feeds the GSTR-1 quantity column (0 if unknown)
+  taxableValue: number;
+  cgst: number;
+  sgst: number;
+  igst: number;
+  grandTotal: number;
+  reference: string; // the original invoice's own number, free text
+}
+
+// One invoice whose number moved when the series was re-ordered by date.
+export interface RenumberChange {
+  oldNo: string; // "" for the just-uploaded invoice
+  invoiceNo: string;
+  invoiceDate: string;
+  customerName: string;
+}
+
+export interface CreateWholesaleResult {
+  invoiceNo: string;
+  renumbered: RenumberChange[];
 }

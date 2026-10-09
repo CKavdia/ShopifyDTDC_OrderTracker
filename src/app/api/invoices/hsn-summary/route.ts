@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { buildGstr1Summary, renderGstr1Workbook } from "@/lib/invoice/gstr1.server";
+import { data } from "@/lib/data";
 
 // exceljs + Shopify fetching need the Node.js runtime (not Edge).
 export const runtime = "nodejs";
@@ -35,10 +36,12 @@ export async function GET(request: NextRequest) {
     const startISO = `${start}T00:00:00${TZ_OFFSET}`;
     const endISO = `${end}T23:59:59${TZ_OFFSET}`;
 
-    const summary = await buildGstr1Summary(startISO, endISO);
+    // Match the invoice PDFs' COD-fee setting so the filed summary mirrors them.
+    const hideCodFee = await data.getInvoiceHideCodFee();
+    const summary = await buildGstr1Summary(startISO, endISO, { hideCodFee });
     if (summary.rows.length === 0) {
       return NextResponse.json(
-        { error: "No paid orders found in this range." },
+        { error: "No paid orders or wholesale invoices found in this range." },
         { status: 404 }
       );
     }

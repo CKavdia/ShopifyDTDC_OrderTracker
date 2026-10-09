@@ -109,12 +109,16 @@ export interface InvoiceAddress {
   phone: string | null;
 }
 export interface InvoiceLineItem {
+  id: string;
   title: string;
   quantity: number;
   currentQuantity: number; // quantity after order edits/refunds (0 = removed)
   sku: string | null;
   variantTitle: string | null;
   vendor: string | null;
+  // Variant image for the invoice's thumbnail column (null when the variant
+  // has no image or was deleted after the order).
+  imageUrl: string | null;
   originalUnitPriceSet: InvoiceMoney;
   originalTotalSet: InvoiceMoney;
   totalDiscountSet: InvoiceMoney;
@@ -134,8 +138,20 @@ export interface InvoiceOrder {
   totalDiscountsSet: InvoiceMoney;
   totalPriceSet: InvoiceMoney;
   totalShippingPriceSet: InvoiceMoney;
+  // Cash actually kept from the customer: Shopify's current (post-edit,
+  // post-recorded-refund) total, NOT reduced by un-refunded returned value.
+  // Exposed for bookkeeping notes — store credit owed = collected − invoice.
+  collectedTotalPriceSet?: InvoiceMoney;
   shippingTitle: string | null; // e.g. "COD Fee", "Standard"
   taxesIncluded: boolean;
+  // Order-level discount identities, for conditional-offer revocation on
+  // returns. name = code (code-based) or title (automatic); percentage null
+  // for fixed-amount discounts.
+  discounts?: Array<{ name: string; percentage: number | null }>;
+  // True when any CLOSED return exists on the order (goods genuinely came
+  // back). Drives conditional-offer revocation in calc.ts. Absent on
+  // synthetic (manual) orders, which can never revoke.
+  hasClosedReturn?: boolean;
   billingAddress: InvoiceAddress | null;
   shippingAddress: InvoiceAddress | null;
   lineItems: InvoiceLineItem[];
@@ -166,18 +182,59 @@ const INVOICE_ORDER_QUERY = `
       lineItems(first: 100) {
         edges {
           node {
+            id
             title
             quantity
             currentQuantity
             sku
             variantTitle
             vendor
+            variant { image { url } }
             originalUnitPriceSet { shopMoney { amount } }
             originalTotalSet { shopMoney { amount } }
             totalDiscountSet { shopMoney { amount } }
             discountAllocations { allocatedAmountSet { shopMoney { amount } } }
             taxLines { title ratePercentage priceSet { shopMoney { amount } } }
             product { id hsn: metafield(namespace: "custom", key: "hsn_sac") { value } }
+          }
+        }
+      }
+      returns(first: 10) {
+        edges {
+          node {
+            status
+            returnLineItems(first: 10) {
+              edges {
+                node {
+                  quantity
+                  ... on ReturnLineItem {
+                    fulfillmentLineItem { lineItem { id } }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      refunds {
+        refundLineItems(first: 10) {
+          edges {
+            node {
+              quantity
+              lineItem { id }
+            }
+          }
+        }
+      }
+      discountApplications(first: 10) {
+        edges {
+          node {
+            value {
+              __typename
+              ... on PricingPercentageValue { percentage }
+            }
+            ... on DiscountCodeApplication { code }
+            ... on AutomaticDiscountApplication { title }
           }
         }
       }
@@ -204,7 +261,38 @@ export async function getOrderForInvoice(
           currentTotalDiscountsSet: InvoiceMoney;
           currentTotalPriceSet: InvoiceMoney;
           shippingLine: { title: string } | null;
-          lineItems: { edges: Array<{ node: InvoiceLineItem }> };
+          returns: {
+            edges: Array<{
+              node: {
+                status: string;
+                returnLineItems: {
+                  edges: Array<{
+                    node: {
+                      quantity: number;
+                      fulfillmentLineItem: { lineItem: { id: string } } | null;
+                    };
+                  }>;
+                };
+              };
+            }>;
+          } | null;
+          refunds: Array<{
+            refundLineItems: {
+              edges: Array<{
+                node: { quantity: number; lineItem: { id: string } | null };
+              }>;
+            } | null;
+          }> | null;
+          discountApplications: {
+            edges: Array<{
+              node: {
+                value: { __typename: string; percentage?: number } | null;
+                code?: string;
+                title?: string;
+              };
+            }>;
+          } | null;
+          lineItems: { edges: Array<{ node: Omit<InvoiceLineItem, "imageUrl"> & { variant: { image: { url: string } } | null } }> };
         })
       | null;
   }>(INVOICE_ORDER_QUERY, { id: gid });
@@ -215,18 +303,75 @@ export async function getOrderForInvoice(
   const scale = (m: InvoiceMoney, factor: number): InvoiceMoney => ({
     shopMoney: { amount: (Number(m.shopMoney.amount) * factor).toString() },
   });
+  const subtractMoney = (m: InvoiceMoney, v: number): InvoiceMoney => ({
+    shopMoney: { amount: (Number(m.shopMoney.amount) - v).toFixed(2) },
+  });
+
+  // --- Returned goods ---------------------------------------------------
+  // Goods actually returned come OFF the invoice. A return only counts once
+  // it is CLOSED (goods genuinely back); OPEN/CANCELED ones are pending. The
+  // returned quantity is subtracted from the line, the line's money is
+  // prorated to the remaining quantity, and a fully-returned line is dropped.
+  //
+  // Money: Shopify's CURRENT totals still count returned goods when no refund
+  // was recorded (e.g. the customer took store credit). Only the un-refunded
+  // returned portion is subtracted from the totals — a recorded refund has
+  // already lowered them. Un-adjusted, round-off would silently absorb the
+  // returned item's value.
+  const returnedQtyById = new Map<string, number>();
+  const refundedQtyById = new Map<string, number>();
+  let hasClosedReturn = false;
+  for (const edge of o.returns?.edges ?? []) {
+    if (edge.node.status !== "CLOSED") continue;
+    hasClosedReturn = true;
+    for (const e of edge.node.returnLineItems.edges) {
+      const id = e.node.fulfillmentLineItem?.lineItem?.id;
+      if (id) returnedQtyById.set(id, (returnedQtyById.get(id) ?? 0) + e.node.quantity);
+    }
+  }
+  for (const ref of o.refunds ?? []) {
+    for (const e of ref?.refundLineItems?.edges ?? []) {
+      const id = e.node.lineItem?.id;
+      if (id) refundedQtyById.set(id, (refundedQtyById.get(id) ?? 0) + e.node.quantity);
+    }
+  }
+
+  let returnedMoneyTotal = 0; // tax-inclusive value returned but not refunded
+  let returnedTaxTotal = 0;
 
   const lineItems = o.lineItems.edges
     .map((e) => e.node)
-    .filter((li) => (li.currentQuantity ?? li.quantity) > 0)
+    .map(({ variant, ...li }) => ({ ...li, imageUrl: variant?.image?.url ?? null }))
     .map((li) => {
-      const cq = li.currentQuantity ?? li.quantity;
-      if (cq === li.quantity) return li;
-      // Quantity reduced by an edit — prorate the money fields to it.
-      const f = cq / li.quantity;
+      const returned = returnedQtyById.get(li.id) ?? 0;
+      const baseQty = li.currentQuantity ?? li.quantity; // after order edits
+      const effQty = baseQty - returned;
+      // Returned but never refunded (store credit / refund paid outside
+      // Shopify) — the money still sits in Shopify's current totals.
+      const unrefunded = Math.max(0, returned - (refundedQtyById.get(li.id) ?? 0));
+
+      if (unrefunded > 0) {
+        const discounts = li.discountAllocations.reduce(
+          (s, a) => s + Number(a.allocatedAmountSet.shopMoney.amount),
+          0
+        );
+        const netInclTax = Number(li.originalTotalSet.shopMoney.amount) - discounts;
+        const f = unrefunded / li.quantity;
+        returnedMoneyTotal += netInclTax * f;
+        returnedTaxTotal +=
+          li.taxLines.reduce(
+            (s, t) => s + Number(t.priceSet.shopMoney.amount),
+            0
+          ) * f;
+      }
+
+      if (returned <= 0 && baseQty === li.quantity) return li;
+      if (effQty <= 0) return null; // fully returned / removed — off the invoice
+      // Prorate the remaining quantity's money fields (edit + return combined).
+      const f = effQty / li.quantity;
       return {
         ...li,
-        quantity: cq,
+        quantity: effQty,
         originalTotalSet: scale(li.originalTotalSet, f),
         totalDiscountSet: scale(li.totalDiscountSet, f),
         discountAllocations: li.discountAllocations.map((a) => ({
@@ -237,16 +382,28 @@ export async function getOrderForInvoice(
           priceSet: scale(t.priceSet, f),
         })),
       };
-    });
+    })
+    .filter((li): li is NonNullable<typeof li> => li !== null);
 
   return {
     ...o,
-    // Current (post-edit) totals are authoritative for reconciliation.
+    // Current (post-edit) totals are authoritative for reconciliation,
+    // reduced by the un-refunded returned value.
     subtotalPriceSet: o.currentSubtotalPriceSet,
-    totalTaxSet: o.currentTotalTaxSet,
+    totalTaxSet: subtractMoney(o.currentTotalTaxSet, returnedTaxTotal),
     totalDiscountsSet: o.currentTotalDiscountsSet,
-    totalPriceSet: o.currentTotalPriceSet,
+    totalPriceSet: subtractMoney(o.currentTotalPriceSet, returnedMoneyTotal),
+    collectedTotalPriceSet: o.currentTotalPriceSet,
     shippingTitle: o.shippingLine?.title ?? null,
+    hasClosedReturn,
+    discounts: (o.discountApplications?.edges ?? []).map(({ node }) => ({
+      name: node.code || node.title || "",
+      percentage:
+        node.value?.__typename === "PricingPercentageValue" &&
+        typeof node.value.percentage === "number"
+          ? node.value.percentage
+          : null,
+    })),
     lineItems,
   };
 }

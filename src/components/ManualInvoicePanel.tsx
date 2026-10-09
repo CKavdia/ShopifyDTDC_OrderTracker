@@ -28,6 +28,7 @@ function inr(n: number): string {
 // survives editing instead of being coerced to 0 on every keystroke. `toInput`
 // is the single place they become numbers.
 interface DraftLine {
+  itemCode: string;
   description: string;
   hsn: string;
   unit: string;
@@ -52,7 +53,7 @@ interface Draft {
 }
 
 function emptyDraftLine(): DraftLine {
-  return { description: "", hsn: "", unit: "PCS", qty: "1", rate: "", gstRate: 5, discount: "" };
+  return { itemCode: "", description: "", hsn: "", unit: "PCS", qty: "1", rate: "", gstRate: 5, discount: "" };
 }
 
 function emptyDraft(): Draft {
@@ -80,6 +81,7 @@ function toInput(d: Draft): ManualInvoiceInput {
   return {
     ...d,
     lines: d.lines.map((l) => ({
+      itemCode: l.itemCode,
       description: l.description,
       hsn: l.hsn,
       unit: l.unit,
@@ -460,9 +462,10 @@ export function ManualInvoicePanel({ visible, onClose }: ManualInvoicePanelProps
         </div>
 
         <div className="overflow-x-auto">
-          <table className="w-full text-sm min-w-[820px]">
+          <table className="w-full text-sm min-w-[940px]">
             <thead>
               <tr className="text-[11px] text-zinc-500 text-left">
+                <th className="font-normal pb-1 pr-2 w-24">Item Code</th>
                 <th className="font-normal pb-1 pr-2">Description *</th>
                 <th className="font-normal pb-1 pr-2 w-24">HSN/SAC</th>
                 <th className="font-normal pb-1 pr-2 w-20">Qty</th>
@@ -477,6 +480,13 @@ export function ManualInvoicePanel({ visible, onClose }: ManualInvoicePanelProps
             <tbody>
               {draft.lines.map((l, i) => (
                 <tr key={i}>
+                  <td className="py-1 pr-2">
+                    <Input
+                      className={INPUT_CLASS}
+                      value={l.itemCode}
+                      onChange={(e) => updateLine(i, "itemCode", e.target.value)}
+                    />
+                  </td>
                   <td className="py-1 pr-2">
                     <Input
                       className={INPUT_CLASS}

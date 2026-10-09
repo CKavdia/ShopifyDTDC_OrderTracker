@@ -45,6 +45,7 @@ export interface ManualParty {
 }
 
 export interface ManualLineInput {
+  itemCode: string; // the invoice's "Item Code" column (blank prints empty)
   description: string;
   hsn: string;
   unit: string; // the invoice's "per" column, e.g. PCS / SET / MTR
@@ -82,7 +83,7 @@ export function emptyParty(): ManualParty {
 }
 
 export function emptyLine(): ManualLineInput {
-  return { description: "", hsn: "", unit: "PCS", qty: 1, rate: 0, gstRate: 5, discount: 0 };
+  return { itemCode: "", description: "", hsn: "", unit: "PCS", qty: 1, rate: 0, gstRate: 5, discount: 0 };
 }
 
 export function emptyManualInvoice(): ManualInvoiceInput {
@@ -123,6 +124,7 @@ export function buildManualInvoiceModel(input: ManualInvoiceInput): InvoiceModel
     lines.push(
       computeManualLine(
         {
+          itemCode: "",
           description: "Shipping & Handling",
           hsn: "",
           unit: "", // service line — kept out of the pieces total
@@ -241,8 +243,11 @@ export function computeManualLine(
   const splitGst = money(cgst.plus(sgst).plus(igst));
 
   return {
+    key: "", // manual line — never matched by a price override
     title: li.description.trim() || "Item",
     variantTitle: "",
+    itemCode: (li.itemCode || "").trim(),
+    imageUrl: "",
     sku: "",
     hsn: (li.hsn || "").trim(),
     unit: (li.unit || "").trim(),
@@ -355,6 +360,7 @@ export function parseManualInvoiceInput(body: unknown): ManualInvoiceInput {
     lines: rawLines.map((l) => {
       const r = (l ?? {}) as Record<string, unknown>;
       return {
+        itemCode: str(r.itemCode),
         description: str(r.description),
         hsn: str(r.hsn),
         unit: str(r.unit) || "PCS",

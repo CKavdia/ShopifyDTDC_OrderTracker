@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { generateInvoicePdf } from "@/lib/invoice/generate.server";
+import { data } from "@/lib/data";
 
 // Puppeteer needs the Node.js runtime (not Edge).
 export const runtime = "nodejs";
@@ -12,7 +13,11 @@ export async function GET(
 ) {
   try {
     const { shopifyOrderId } = await params;
-    const { pdf, filename } = await generateInvoicePdf(shopifyOrderId);
+    // Current display flag — controls whether the COD fee line is included.
+    const hideCodFee = await data.getInvoiceHideCodFee();
+    const { pdf, filename } = await generateInvoicePdf(shopifyOrderId, {
+      hideCodFee,
+    });
 
     return new NextResponse(Buffer.from(pdf), {
       status: 200,
